@@ -1,49 +1,41 @@
-// GreenGold EMMA — v2.1 "Strict Intake + Sticky Session"
+// GreenGold EMMA — v2.2 "Undo Re-Review + Smarter Intake"
 // ─────────────────────────────────────────────────────────────────────────────
-// FIXES
-// • Strict order detection for your format (Order ID: GG-YYYYMMDD-HHMMSS-XXXX, Total: ETB …)
-// • Sticky session: if customer is mid-flow, we don't escalate random texts
-// • Keeps all v2.0/2.0 features: 60s hold+undo, give-up, support escalation, TTL, flags, no-driver nudge,
-//   compact Amharic driver card, Sheets hooks, owner overrides.
+// NEW IN THIS PATCH
+// • After staff taps Undo (within 60s), bot posts fresh Approve/Reject buttons for the same REF
+//   and resets TTL (createdAt = now()) so actions don’t “expire” immediately.
+// • Sticky session smarter:
+//   - If user is AWAITING_PAYMENT and sends random text → remind to pick a method (no auto buttons spam).
+//   - If they ask a question (“?”, “help”, “support”) → escalate to Support.
+//   - Added /cancel to clear current session cleanly.
+// • Keeps v2.1/v2.0 features: strict order detection, 6pm line, 60s hold+undo, give-up, TTL,
+//   receipt flags, no-driver nudge, Amharic driver card, owner overrides, (optional) Sheets logging.
 //
 // DROP-IN: paste over existing index.js and deploy.
 //
-// ENV (Render → Settings → Environment):
-// - BOT_TOKEN (required)
-// - OWNER_IDS (comma sep) e.g. 7286480319
-// - STAFF_GROUP_ID (negative id)
-// - SUPPORT_GROUP_ID (negative id)
-// - APPROVE_SCOPE = members | admins    (default: members)
-// - DRIVER_WINDOW_MS = 1800000          (default: 30m)
-// - DEEP_LINK_TTL_MS = 1800000          (default: 30m)
-// - BUTTON_TTL_SEC = 900                (default: 15m)
-// - TELEBIRR_TEXT / BANK_TEXT           (optional custom copy)
-// - SUPPORT_PHONE = +251 2601986        (default set)
-// - ENABLE_SHEETS_EXPORT = true|false   (default: false)
-// - SHEETS_WEBHOOK_URL = https://...    (Apps Script “web app” URL)
+// ENV keys: same as v2.1 (BOT_TOKEN, OWNER_IDS, STAFF_GROUP_ID, SUPPORT_GROUP_ID, APPROVE_SCOPE,
+// DRIVER_WINDOW_MS, DEEP_LINK_TTL_MS, BUTTON_TTL_SEC, TELEBIRR_TEXT, BANK_TEXT, SUPPORT_PHONE,
+// ENABLE_SHEETS_EXPORT, SHEETS_WEBHOOK_URL)
 
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 
 // ---------- Required config ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
-if (!BOT_TOKEN) { console.error('Missing BOT_TOKEN in .env'); process.exit(1); }
+if (!BOT_TOKEN) { console.error('Missing BOT_TOKEN'); process.exit(1); }
 
 const OWNER_IDS = String(process.env.OWNER_IDS || '')
   .split(',')
   .map(s => Number(s.trim()))
   .filter(n => Number.isFinite(n));
-if (OWNER_IDS.length === 0) {
-  console.warn('WARNING: OWNER_IDS not set. Set OWNER_IDS=7286480319 (or comma-separated list).');
-}
+if (OWNER_IDS.length === 0) console.warn('WARNING: OWNER_IDS not set.');
 
 let STAFF_GROUP_ID   = process.env.STAFF_GROUP_ID   ? Number(process.env.STAFF_GROUP_ID)   : null;
 let SUPPORT_GROUP_ID = process.env.SUPPORT_GROUP_ID ? Number(process.env.SUPPORT_GROUP_ID) : null;
 
 const DRIVER_WINDOW_MS = Number(process.env.DRIVER_WINDOW_MS || 30 * 60 * 1000);
 const DEEP_LINK_TTL_MS = Number(process.env.DEEP_LINK_TTL_MS || 30 * 60 * 1000);
-const APPROVE_SCOPE    = (process.env.APPROVE_SCOPE || 'members').toLowerCase(); // 'members' or 'admins'
-const BUTTON_TTL_SEC   = Number(process.env.BUTTON_TTL_SEC || 900); // 15 min default
+const APPROVE_SCOPE    = (process.env.APPROVE_SCOPE || 'members').toLowerCase();
+const BUTTON_TTL_SEC   = Number(process.env.BUTTON_TTL_SEC || 900);
 const SUPPORT_PHONE    = (process.env.SUPPORT_PHONE || '+251 2601986');
 
 const ENABLE_SHEETS_EXPORT = String(process.env.ENABLE_SHEETS_EXPORT || 'false').toLowerCase() === 'true';
@@ -64,14 +56,14 @@ Branch: Bambis Branch
 Please send a clear screenshot of your payment receipt here.`).trim();
 
 // ---------- In-memory stores ----------
-const sessions = new Map();   // customer_id -> { ref, summary, status, method, assigned_driver_id, driverTimer, approvalTimer, holdMsgId, giveupUntil, createdAt }
-const refs     = new Map();   // ref -> customer_id
-const tokens   = new Map();   // for deep-link tests; owner can create
+const sessions = new Map();   // uid -> { ref, summary, status, method, assigned_driver_id, driverTimer, approvalTimer, holdMsgId, giveupUntil, createdAt }
+const refs     = new Map();   // ref -> uid
+const tokens   = new Map();   // deep-link test tokens
 const drivers  = new Map();   // driver_id -> { id, name, phone }
 let maintenance = { on: false, note: '' };
-const userRate = new Map();   // user_id -> lastTs
-const seenReceiptIds = new Set(); // duplicate receipt detection
-const orderLog = [];          // in-memory milestone log (optionally mirrored to Sheets)
+const userRate = new Map();   // uid -> lastTs
+const seenReceiptIds = new Set();
+const orderLog = [];
 
 // ---------- Helpers ----------
 const bot = new Telegraf(BOT_TOKEN);
@@ -89,7 +81,6 @@ function now() { return Date.now(); }
 function getSessionByRef(ref) { const uid = refs.get(ref); return uid ? sessions.get(uid) : null; }
 function ttlExpired(s) { return !s || (now() - s.createdAt) > (BUTTON_TTL_SEC * 1000); }
 
-// Addis time helper (UTC+3, no DST)
 function isAfter6pmAddis() {
   const utcHour = new Date().getUTCHours();
   const addisHour = (utcHour + 3) % 24;
@@ -102,22 +93,21 @@ function composeWelcomeEcho(ref) {
     : base;
 }
 
-// STRICT order detection matched to your format
-const REF_PATTERN = /\bGG-\d{8}-\d{6}-[A-Z0-9]{4}\b/;                // GG-YYYYMMDD-HHMMSS-XXXX
-const ORDER_HEADER = /(?:^|\n)\s*🧾\s*Order ID:\s*GG-/i;            // "🧾 Order ID: GG-..."
-const HAS_TOTAL    = /\bTotal:\s*ETB\s*\d/i;                        // "Total: ETB 7600"
-const HAS_ETB      = /\bETB\b/i;
-const HAS_QTY      = /\b(Qty|Quantity)\b|\bx\s*\d+/i;
+// Strict detector tuned to your format
+const REF_PATTERN   = /\bGG-\d{8}-\d{6}-[A-Z0-9]{4}\b/;           // GG-YYYYMMDD-HHMMSS-XXXX
+const ORDER_HEADER  = /(?:^|\n)\s*🧾\s*Order ID:\s*GG-/i;         // 🧾 Order ID: GG-...
+const HAS_TOTAL     = /\bTotal:\s*ETB\s*\d/i;
+const HAS_ETB       = /\bETB\b/i;
+const HAS_QTY       = /\b(Qty|Quantity)\b|\bx\s*\d+/i;
 
 function isOrderSummaryStrict(text) {
   const t = text || '';
   if (t.length < 50) return false;
-  const byHeader = ORDER_HEADER.test(t) && REF_PATTERN.test(t) && (HAS_TOTAL.test(t) || HAS_ETB.test(t));
+  const byHeader  = ORDER_HEADER.test(t) && REF_PATTERN.test(t) && (HAS_TOTAL.test(t) || HAS_ETB.test(t));
   const bySignals = REF_PATTERN.test(t) && HAS_ETB.test(t) && HAS_QTY.test(t);
   return byHeader || bySignals;
 }
 
-// Parse useful bits for driver compact card (best effort)
 function parseOrderFields(text) {
   const t = text || '';
   let qty = (t.match(/\bqty[:\s]*([0-9]+)\b/i) || t.match(/\bx\s*([0-9]+)\b/i) || t.match(/\bitems?[:\s]*([0-9]+)\b/i) || [,'—'])[1];
@@ -143,7 +133,7 @@ async function isGroupAdmin(ctx) {
 async function canApprove(ctx) {
   if (!isGroup(ctx) || ctx.chat.id !== STAFF_GROUP_ID) return false;
   if (APPROVE_SCOPE === 'admins') return isGroupAdmin(ctx);
-  return true; // members
+  return true;
 }
 function setDriverTimer(ref) {
   const s = getSessionByRef(ref);
@@ -162,25 +152,21 @@ function setDriverTimer(ref) {
     }
   }, DRIVER_WINDOW_MS);
 }
-function clearDriverTimer(s) {
-  if (s?.driverTimer) { clearTimeout(s.driverTimer); s.driverTimer = null; }
-}
-function rateLimited(userId, minMs = 1500) {
-  const last = userRate.get(userId) || 0;
+function clearDriverTimer(s) { if (s?.driverTimer) { clearTimeout(s.driverTimer); s.driverTimer = null; } }
+function rateLimited(uid, minMs = 1500) {
+  const last = userRate.get(uid) || 0;
   const ok = now() - last >= minMs;
-  if (ok) userRate.set(userId, now());
+  if (ok) userRate.set(uid, now());
   return !ok;
 }
 function maskUsername(u) { return u ? '@' + u : 'no_username'; }
 
-// Sheets logging (optional)
 async function logMilestone(milestone, s, extra = {}) {
   try {
     const customer_id = refs.get(s.ref);
     const row = {
       timestamp: new Date().toISOString(),
-      milestone,
-      ref: s.ref,
+      milestone, ref: s.ref,
       total: parseOrderFields(s.summary).total || '—',
       delivery_fee: parseOrderFields(s.summary).delivery || '—',
       area: parseOrderFields(s.summary).area || '—',
@@ -193,25 +179,18 @@ async function logMilestone(milestone, s, extra = {}) {
     };
     orderLog.push(row);
     if (ENABLE_SHEETS_EXPORT && SHEETS_WEBHOOK_URL) {
-      await fetch(SHEETS_WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(row)
-      });
+      await fetch(SHEETS_WEBHOOK_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(row) });
     }
-  } catch (e) { /* silent */ }
+  } catch {}
 }
 
 // ---------- Health & Utility ----------
 bot.start(async (ctx) => {
   const txt = ctx.message?.text || '';
-  const parts = txt.split(' ');
-  const payload = parts[1];
+  const payload = txt.split(' ')[1];
   if (payload && payload.startsWith('GG_')) {
     const t = tokens.get(payload);
-    if (!t || (now() - t.createdAt) > DEEP_LINK_TTL_MS) {
-      return ctx.reply('This link expired. Go back to our website and tap Order Now again.');
-    }
+    if (!t || (now() - t.createdAt) > DEEP_LINK_TTL_MS) return ctx.reply('This link expired. Go back to our website and tap Order Now again.');
     const ref = genRef();
     sessions.set(ctx.from.id, { ref, summary: t.summary, status: 'AWAITING_PAYMENT', method: null, assigned_driver_id: null, driverTimer: null, approvalTimer: null, holdMsgId: null, giveupUntil: null, createdAt: now() });
     refs.set(ref, ctx.from.id);
@@ -225,7 +204,7 @@ bot.command('ping', async (ctx) => ctx.reply(`pong | ${new Date().toISOString()}
 bot.command('me',   async (ctx) => ctx.reply(`Your ID: ${ctx.from.id}`));
 bot.command('id',   async (ctx) => ctx.reply(`Chat ID: ${ctx.chat.id}`));
 
-// ---------- Bind staff group (owner only, in group) ----------
+// Bind staff
 bot.command('setstaff', async (ctx) => {
   if (!isGroup(ctx)) return ctx.reply('Run /setstaff inside the staff group.');
   if (!isOwner(ctx)) return ctx.reply('Not authorized (owner only).');
@@ -233,37 +212,30 @@ bot.command('setstaff', async (ctx) => {
   await ctx.reply(`Staff group bound: ${STAFF_GROUP_ID}`);
 });
 
-// ---------- Maintenance (owner DM) ----------
+// Maintenance
 bot.command('maintenance', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   const args = ctx.message.text.split(' ').slice(1);
   const mode = (args.shift() || '').toLowerCase();
-  if (mode === 'on') {
-    maintenance.on = true; maintenance.note = args.join(' ') || '';
-    return ctx.reply(`✅ Maintenance ON\nNote: ${maintenance.note}`);
-  } else if (mode === 'off') {
-    maintenance.on = false; maintenance.note = '';
-    return ctx.reply('✅ Maintenance OFF');
-  } else {
-    return ctx.reply('Usage:\n/maintenance on <note>\n/maintenance off');
-  }
+  if (mode === 'on') { maintenance.on = true; maintenance.note = args.join(' ') || ''; return ctx.reply(`✅ Maintenance ON\nNote: ${maintenance.note}`); }
+  if (mode === 'off') { maintenance.on = false; maintenance.note = ''; return ctx.reply('✅ Maintenance OFF'); }
+  return ctx.reply('Usage:\n/maintenance on <note>\n/maintenance off');
 });
 
-// ---------- Approve scope toggle (owner DM) ----------
+// Approver rule
 bot.command('approverule', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   const v = (ctx.message.text.split(' ')[1] || '').toLowerCase();
   if (!['members','admins'].includes(v)) return ctx.reply('Usage: /approverule members|admins');
-  process.env.APPROVE_SCOPE = v; // reflect at runtime
+  process.env.APPROVE_SCOPE = v;
   return ctx.reply(`✅ Approve scope set to: ${v}`);
 });
 
-// ---------- Payment texts (owner DM) ----------
+// Payment text management
 const waitFor = new Map(); // chat_id -> 'telebirr'|'bank'
 bot.command('settelebirr', async (ctx) => { if (!isOwner(ctx) || !isPrivate(ctx)) return; waitFor.set(ctx.chat.id, 'telebirr'); ctx.reply('Send the new Telebirr text as your next message.'); });
 bot.command('setbank',     async (ctx) => { if (!isOwner(ctx) || !isPrivate(ctx)) return; waitFor.set(ctx.chat.id, 'bank');     ctx.reply('Send the new Bank text as your next message.'); });
 bot.command('getpay',      async (ctx) => { if (!isOwner(ctx) || !isPrivate(ctx)) return; ctx.reply(`Telebirr:\n${TELEBIRR_TEXT}\n\nBank:\n${BANK_TEXT}`); });
-
 bot.on('text', async (ctx, next) => {
   const pending = waitFor.get(ctx.chat.id);
   if (pending && isPrivate(ctx) && isOwner(ctx)) {
@@ -275,7 +247,7 @@ bot.on('text', async (ctx, next) => {
   return next();
 });
 
-// ---------- Owner driver management (DM) ----------
+// Drivers mgmt
 bot.command('adddriver', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   const raw = ctx.message.text.split(' ').slice(1).join(' ');
@@ -302,16 +274,19 @@ bot.command('removedriver', async (ctx) => {
   return ctx.reply(`✅ Driver removed: ${id}`);
 });
 
-// ---------- Owner overrides (DM) ----------
+// Owner overrides
 bot.command('revert', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   const ref = (ctx.message.text.split(' ')[1] || '').trim();
   const s = getSessionByRef(ref);
   if (!s) return ctx.reply('Ref not found.');
+  const uid = refs.get(ref);
+  if (uid) refs.set(ref, uid); // no-op, ensures mapping stays
   s.status = 'AWAITING_RECEIPT';
   s.assigned_driver_id = null;
   s.giveupUntil = null;
   clearDriverTimer(s);
+  s.createdAt = now(); // refresh TTL
   return ctx.reply(`↩️ Reverted order ${ref} to AWAITING_RECEIPT.`);
 });
 bot.command('forceapprove', async (ctx) => {
@@ -335,7 +310,18 @@ bot.command('config_export', async (ctx) => {
   return ctx.reply('CONFIG:\n' + JSON.stringify(cfg, null, 2));
 });
 
-// ---------- Support escalation ----------
+// Customer helpers
+bot.command('cancel', async (ctx) => {
+  if (!isPrivate(ctx)) return;
+  const s = sessions.get(ctx.from.id);
+  if (!s) return ctx.reply('No active order to cancel.');
+  refs.delete(s.ref);
+  clearDriverTimer(s);
+  sessions.delete(ctx.from.id);
+  return ctx.reply('🧹 Your current order flow was canceled. You can paste a new order summary anytime.');
+});
+
+// Support escalation
 async function escalateToSupport(ctx, rawText) {
   if (!SUPPORT_GROUP_ID) {
     return ctx.reply(
@@ -344,9 +330,7 @@ async function escalateToSupport(ctx, rawText) {
     );
   }
   const user = ctx.from;
-  const kb = Markup.inlineKeyboard([
-    [Markup.button.callback('I’ll handle', `support_claim:${user.id}`)]
-  ]);
+  const kb = Markup.inlineKeyboard([[Markup.button.callback('I’ll handle', `support_claim:${user.id}`)]]);
   const post = await bot.telegram.sendMessage(
     SUPPORT_GROUP_ID,
     `🆘 Customer Help Needed\nUser: ${user.first_name || ''} ${user.last_name || ''} (${maskUsername(user.username)})\n` +
@@ -357,7 +341,7 @@ async function escalateToSupport(ctx, rawText) {
   return post;
 }
 
-// ---------- Customer intake (DM) ----------
+// Intake reply
 async function sendSummaryWithPay(ctx, summary, ref) {
   const kb = Markup.inlineKeyboard([
     [Markup.button.callback('Telebirr', `pay:telebirr:${ref}`), Markup.button.callback('CBE Bank', `pay:bank:${ref}`)]
@@ -365,9 +349,10 @@ async function sendSummaryWithPay(ctx, summary, ref) {
   await ctx.reply(composeWelcomeEcho(ref), kb);
 }
 
+// ---------- Text DM logic ----------
 bot.on('text', async (ctx) => {
   if (!isPrivate(ctx)) return;
-  if (ctx.message.text.startsWith('/')) return; // handled above
+  if (ctx.message.text.startsWith('/')) return;
 
   if (maintenance.on) {
     const note = maintenance.note ? ` (Note: ${maintenance.note})` : '';
@@ -376,33 +361,33 @@ bot.on('text', async (ctx) => {
   if (rateLimited(ctx.from.id)) return ctx.reply('Please wait a moment before sending another message.');
 
   const text = ctx.message.text.trim();
+  const isQuestion = /[?]|help|support/i.test(text);
 
-  // STICKY SESSION: if user is mid-order, don't escalate
+  // Sticky session: don’t misroute mid-flow
   const existing = sessions.get(ctx.from.id);
   if (existing) {
     if (existing.status === 'AWAITING_RECEIPT') {
-      // They still owe a photo; don't escalate — remind softly
       return ctx.reply('Please attach a clear screenshot of the payment receipt here.');
     }
     if (existing.status === 'AWAITING_PAYMENT') {
-      // Reshow payment options for their existing ref (don’t make a new ref)
-      const kb = Markup.inlineKeyboard([
-        [Markup.button.callback('Telebirr', `pay:telebirr:${existing.ref}`), Markup.button.callback('CBE Bank', `pay:bank:${existing.ref}`)]
-      ]);
-      return ctx.reply(composeWelcomeEcho(existing.ref), kb);
+      if (isQuestion) return escalateToSupport(ctx, text);
+      // gentle nudge (no auto keyboard spam)
+      return ctx.reply(`You already started order ${existing.ref}. Please tap a payment method above (Telebirr or CBE).`);
     }
-    // Otherwise (assigned/out for delivery), treat new message as potential support question
+    // Active delivery states → treat messages as support unless they paste a brand-new summary
     if (!isOrderSummaryStrict(text)) {
-      return escalateToSupport(ctx, text);
+      if (isQuestion || text.length < 50) return escalateToSupport(ctx, text);
+      return ctx.reply(`Order ${existing.ref} is in progress. For changes or questions, reply here or call ${SUPPORT_PHONE}.`);
     }
+    // If they paste a new valid summary mid-flow, start a new session (optional). Here we’ll allow it:
+    // first, clear previous mapping (soft reset)
+    refs.delete(existing.ref);
+    sessions.delete(ctx.from.id);
   }
 
-  // STRICT INTAKE: accept only real order summaries; otherwise escalate/help
+  // Strict intake: require real order summary
   if (!isOrderSummaryStrict(text)) {
-    // If it’s a short or question message, go to support; else instruct to use site button + support
-    if (/[?]/.test(text) || text.length < 50) {
-      return escalateToSupport(ctx, text);
-    }
+    if (isQuestion || text.length < 50) return escalateToSupport(ctx, text);
     return ctx.reply(
       `Hmm, I couldn’t read that as an order. Please tap “Order Now” on our site so it pastes the correct summary with a reference.\n` +
       `If you already have an order in progress, call ${SUPPORT_PHONE}.`
@@ -421,12 +406,12 @@ bot.on('text', async (ctx) => {
   await sendSummaryWithPay(ctx, text, ref);
 });
 
-// ---------- Buttons (payment select, group approvals, driver actions, support claim) ----------
+// ---------- Buttons ----------
 bot.on('callback_query', async (ctx, next) => {
   try {
     const data = String(ctx.callbackQuery.data || '');
 
-    // Support claim (from Support group)
+    // Support claim
     if (data.startsWith('support_claim:')) {
       if (!isGroup(ctx) || ctx.chat.id !== SUPPORT_GROUP_ID) return ctx.answerCbQuery('Use inside support group.');
       const customerId = Number(data.split(':')[1]);
@@ -440,7 +425,7 @@ bot.on('callback_query', async (ctx, next) => {
 
     // Customer selects payment method
     if (data.startsWith('pay:')) {
-      const [, method, ref] = data.split(':'); // "pay:telebirr:GG_XXXX"
+      const [, method, ref] = data.split(':');
       const s = getSessionByRef(ref);
       if (!s) return ctx.answerCbQuery('No active order.');
       s.method = method.toUpperCase();
@@ -464,28 +449,34 @@ bot.on('callback_query', async (ctx, next) => {
       if (!STAFF_GROUP_ID || ctx.chat.id !== STAFF_GROUP_ID) return ctx.answerCbQuery('Wrong group.');
       if (!(await canApprove(ctx))) return ctx.answerCbQuery('Not authorized.');
 
-      // Undo
+      // Undo path: re-open Approve/Reject and refresh TTL
       if (data.startsWith('undo:')) {
         const ref = data.split(':')[1];
         const s = getSessionByRef(ref);
         if (!s || s.status !== 'APPROVED_HOLD') return ctx.answerCbQuery('Nothing to undo.');
         if (s.approvalTimer) { clearTimeout(s.approvalTimer); s.approvalTimer = null; }
         s.status = 'AWAITING_RECEIPT';
+        s.assigned_driver_id = null;
+        s.giveupUntil = null;
+        s.createdAt = now(); // refresh TTL
         if (s.holdMsgId) {
           const doneText = `↩️ Approval undone — Ref: ${s.ref}\nCustomer was NOT notified.`;
           await bot.telegram.editMessageText(STAFF_GROUP_ID, s.holdMsgId, undefined, doneText).catch(()=>{});
         }
-        await bot.telegram.sendMessage(STAFF_GROUP_ID, `↩️ Approval undone\nRef: ${s.ref}`);
+        const uid = refs.get(ref);
+        const reKb = Markup.inlineKeyboard([
+          [Markup.button.callback('Approve ✅', `approve:${uid}:${s.ref}`), Markup.button.callback('Reject ❌', `reject:${uid}:${s.ref}`)]
+        ]);
+        await bot.telegram.sendMessage(STAFF_GROUP_ID, `Re-review needed — Ref: ${s.ref}\nChoose an action:`, reKb);
         return ctx.answerCbQuery('Approval undone.');
       }
 
-      // Approve/Reject
-      const [verb, userId, ref] = data.split(':'); // "approve:USERID:GG_XXXX"
+      // Approve/Reject normal
+      const [verb, userId, ref] = data.split(':');
       const uid = Number(userId);
       const s = getSessionByRef(ref) || sessions.get(uid);
       if (!s || s.ref !== ref) return ctx.answerCbQuery('Order not found.');
 
-      // TTL guard (stale approval)
       if (ttlExpired(s)) {
         await ctx.answerCbQuery('This action expired for this order.');
         await ctx.telegram.sendMessage(STAFF_GROUP_ID, `⛔ Action expired — Ref: ${ref}`);
@@ -498,7 +489,7 @@ bot.on('callback_query', async (ctx, next) => {
         const holdMsg = await ctx.telegram.sendMessage(
           STAFF_GROUP_ID,
           `✅ Approved — Ref: ${s.ref}\n⏳ Holding 60s before notifying customer.\nTap Undo to cancel.`,
-          Markup.inlineKeyboard([ [Markup.button.callback('Undo (60s)', `undo:${s.ref}`)] ])
+          Markup.inlineKeyboard([[Markup.button.callback('Undo (60s)', `undo:${s.ref}`)]])
         );
         s.holdMsgId = holdMsg.message_id;
         s.approvalTimer = setTimeout(async () => {
@@ -507,7 +498,7 @@ bot.on('callback_query', async (ctx, next) => {
           await finalizeApproval(fresh, uid).catch(()=>{});
         }, 60 * 1000);
         return ctx.answerCbQuery('Approved (on hold).');
-      } else { // reject
+      } else {
         s.status = 'REJECTED';
         await ctx.telegram.sendMessage(uid, `❌ We couldn’t verify the receipt for ${s.ref}.\nPlease send a clear screenshot (full screen, readable).\nIf you need help, call ${SUPPORT_PHONE}.`);
         await ctx.editMessageCaption({ caption: `📸 Payment screenshot received\nRef: ${s.ref}\nStatus: ❌ Rejected` }).catch(()=>{});
@@ -530,7 +521,7 @@ bot.on('callback_query', async (ctx, next) => {
         }
         s.assigned_driver_id = ctx.from.id;
         s.status = 'ASSIGNED';
-        s.giveupUntil = now() + 2 * 60 * 1000; // 2 minutes to give up
+        s.giveupUntil = now() + 2 * 60 * 1000;
         clearDriverTimer(s);
 
         const driverActions = Markup.inlineKeyboard([
@@ -629,7 +620,7 @@ async function finalizeApproval(s, uid) {
   }
 }
 
-// ---------- Receipt photo ----------
+// Receipt photo
 bot.on('photo', async (ctx) => {
   if (!isPrivate(ctx)) return;
   if (maintenance.on) {
@@ -644,7 +635,6 @@ bot.on('photo', async (ctx) => {
   const best = ctx.message.photo.at(-1);
   const fileId = best.file_id;
 
-  // Duplicate / forwarded
   const isDuplicate = seenReceiptIds.has(fileId);
   seenReceiptIds.add(fileId);
   const isFwd = !!(ctx.message.forward_from || ctx.message.forward_from_chat || ctx.message.forward_date);
@@ -668,11 +658,10 @@ bot.on('photo', async (ctx) => {
 
   await ctx.telegram.sendPhoto(STAFF_GROUP_ID, fileId, { caption, ...actions });
   await ctx.telegram.sendMessage(STAFF_GROUP_ID, `🧾 Order Summary (${s.ref}):\n${s.summary.slice(0, 4000)}`);
-
   await ctx.reply(`📸 Receipt received for ${s.ref}. We’re verifying it. You’ll get an update shortly.`);
 });
 
-// ---------- Guard: expecting photo but got text/other ----------
+// Guard: expecting photo but got something else
 bot.on('message', async (ctx) => {
   if (isPrivate(ctx) && !ctx.message.photo && !ctx.message.text?.startsWith('/')) {
     const s = sessions.get(ctx.from.id);
@@ -680,7 +669,7 @@ bot.on('message', async (ctx) => {
   }
 });
 
-// ---------- Driver broadcast ----------
+// Driver broadcast
 async function broadcastToDrivers(s, excludeId = null) {
   if (drivers.size === 0) {
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ No drivers configured. Use /adddriver in owner DM.`);
@@ -716,13 +705,11 @@ async function broadcastToDrivers(s, excludeId = null) {
       STAFF_GROUP_ID,
       `Driver broadcast sent.\nRef: ${s.ref}\n✅ Sent: ${sent.length ? sent.join(', ') : 'none'}\n⚠️ Failed (DM first): ${failed.length ? failed.join(', ') : 'none'}`
     );
-    if (failed.length) {
-      await bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Could not DM ${failed.length} driver(s). They must DM the bot at least once.`);
-    }
+    if (failed.length) await bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Could not DM ${failed.length} driver(s). They must DM the bot at least once.`);
   }
 }
 
-// ---------- Launch ----------
+// Launch
 bot.launch().then(() => console.log('Polling started…'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
