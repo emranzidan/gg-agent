@@ -1,18 +1,12 @@
-// GreenGold EMMA — v2.0 "Ops Bulletproof"
+// GreenGold EMMA — v2.1 "Strict Intake + Sticky Session"
 // ─────────────────────────────────────────────────────────────────────────────
-// WHAT'S NEW (all in one):
-// • Short welcome + echo (no full summary to customer) + Addis 6pm morning line
-// • 60s Approval Hold + Undo (customer only notified after hold ends)
-// • Driver Give Up (2m) → re-broadcast excluding quitter
-// • Support escalation for non-order/questions (claim button + customer DM)
-// • Stale button TTL guard (Approve/Accept expire after BUTTON_TTL_SEC)
-// • Receipt flags: duplicate file_id + forwarded indicator for staff
-// • No-driver timeout also DMs customer: “Slight delay…”
-// • Compact Amharic driver card (tries to parse qty/area/total/delivery fee/map)
-// • Optional Google Sheets logging on milestones (ENABLE_SHEETS_EXPORT + URL)
-// • Owner overrides: /revert {REF}, /forceapprove {REF}, /config_export
+// FIXES
+// • Strict order detection for your format (Order ID: GG-YYYYMMDD-HHMMSS-XXXX, Total: ETB …)
+// • Sticky session: if customer is mid-flow, we don't escalate random texts
+// • Keeps all v2.0/2.0 features: 60s hold+undo, give-up, support escalation, TTL, flags, no-driver nudge,
+//   compact Amharic driver card, Sheets hooks, owner overrides.
 //
-// DROP-IN: paste over existing index.js and deploy. No other files required.
+// DROP-IN: paste over existing index.js and deploy.
 //
 // ENV (Render → Settings → Environment):
 // - BOT_TOKEN (required)
@@ -27,8 +21,6 @@
 // - SUPPORT_PHONE = +251 2601986        (default set)
 // - ENABLE_SHEETS_EXPORT = true|false   (default: false)
 // - SHEETS_WEBHOOK_URL = https://...    (Apps Script “web app” URL)
-//
-// NOTE: Single instance only (no local + Render). Telegram will split updates.
 
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
@@ -110,23 +102,32 @@ function composeWelcomeEcho(ref) {
     : base;
 }
 
-// Parse useful bits from summary for driver compact card (best effort)
+// STRICT order detection matched to your format
+const REF_PATTERN = /\bGG-\d{8}-\d{6}-[A-Z0-9]{4}\b/;                // GG-YYYYMMDD-HHMMSS-XXXX
+const ORDER_HEADER = /(?:^|\n)\s*🧾\s*Order ID:\s*GG-/i;            // "🧾 Order ID: GG-..."
+const HAS_TOTAL    = /\bTotal:\s*ETB\s*\d/i;                        // "Total: ETB 7600"
+const HAS_ETB      = /\bETB\b/i;
+const HAS_QTY      = /\b(Qty|Quantity)\b|\bx\s*\d+/i;
+
+function isOrderSummaryStrict(text) {
+  const t = text || '';
+  if (t.length < 50) return false;
+  const byHeader = ORDER_HEADER.test(t) && REF_PATTERN.test(t) && (HAS_TOTAL.test(t) || HAS_ETB.test(t));
+  const bySignals = REF_PATTERN.test(t) && HAS_ETB.test(t) && HAS_QTY.test(t);
+  return byHeader || bySignals;
+}
+
+// Parse useful bits for driver compact card (best effort)
 function parseOrderFields(text) {
   const t = text || '';
-  // Qty: "qty: 3", "x3", "items: 3"
   let qty = (t.match(/\bqty[:\s]*([0-9]+)\b/i) || t.match(/\bx\s*([0-9]+)\b/i) || t.match(/\bitems?[:\s]*([0-9]+)\b/i) || [,'—'])[1];
-  // Total: "Total: ETB 1234" or "... 1,234 ETB"
   let total = (t.match(/\btotal[:\s]*ETB[:\s]*([0-9,]+)/i) || t.match(/([0-9][0-9,]+)\s*ETB\b/i) || [,'—'])[1];
   if (total && total !== '—') total = total.replace(/,/g,'');
-  // Delivery fee: "Delivery: ETB 150", "Delivery Fee: 150 ETB"
   let delivery = (t.match(/\b(delivery(?:\s*fee)?)[^\d]*([0-9][0-9,]*)\s*ETB\b/i) || t.match(/\bETB\s*([0-9][0-9,]*)\s*(delivery)/i) || [,'','—'])[2];
   if (delivery && delivery !== '—') delivery = delivery.replace(/,/g,'');
-  // Area: lines with "Area:", "አካባቢ:", "ቦታ:"
-  let area = (t.match(/(?:Area|አካባቢ|ቦታ)[:\s]+(.{2,80})/i) || [,'—'])[1];
+  let area = (t.match(/(?:Address|Area|አካባቢ|ቦታ)[:\s]+(.{2,120})/i) || [,'—'])[1];
   if (area && area !== '—') area = area.split('\n')[0].trim();
-  // Map URL: google maps link if present
   let map = (t.match(/https?:\/\/(?:maps\.google|goo\.gl)\/[^\s)]+/i) || [,'—'])[1];
-  // Phone (optional)
   let phone = (t.match(/\+?251[-\s]?\d{9}/) || t.match(/\b0?9\d{8}\b/) || [,''])[1];
   if (phone && phone.startsWith('0')) phone = '+251' + phone.slice(1);
   return { qty: qty || '—', total: total || '—', delivery: delivery || '—', area: area || '—', map: map || '—', phone: phone || '' };
@@ -178,7 +179,7 @@ async function logMilestone(milestone, s, extra = {}) {
     const customer_id = refs.get(s.ref);
     const row = {
       timestamp: new Date().toISOString(),
-      milestone, // approved | picked_up | delivered | no_driver
+      milestone,
       ref: s.ref,
       total: parseOrderFields(s.summary).total || '—',
       delivery_fee: parseOrderFields(s.summary).delivery || '—',
@@ -376,13 +377,39 @@ bot.on('text', async (ctx) => {
 
   const text = ctx.message.text.trim();
 
-  // If question / not clearly an order → escalate to Support
-  if (/[?]/.test(text) || text.length < 30) {
-    await escalateToSupport(ctx, text);
-    return;
+  // STICKY SESSION: if user is mid-order, don't escalate
+  const existing = sessions.get(ctx.from.id);
+  if (existing) {
+    if (existing.status === 'AWAITING_RECEIPT') {
+      // They still owe a photo; don't escalate — remind softly
+      return ctx.reply('Please attach a clear screenshot of the payment receipt here.');
+    }
+    if (existing.status === 'AWAITING_PAYMENT') {
+      // Reshow payment options for their existing ref (don’t make a new ref)
+      const kb = Markup.inlineKeyboard([
+        [Markup.button.callback('Telebirr', `pay:telebirr:${existing.ref}`), Markup.button.callback('CBE Bank', `pay:bank:${existing.ref}`)]
+      ]);
+      return ctx.reply(composeWelcomeEcho(existing.ref), kb);
+    }
+    // Otherwise (assigned/out for delivery), treat new message as potential support question
+    if (!isOrderSummaryStrict(text)) {
+      return escalateToSupport(ctx, text);
+    }
   }
 
-  // Treat as order summary (paste-mode)
+  // STRICT INTAKE: accept only real order summaries; otherwise escalate/help
+  if (!isOrderSummaryStrict(text)) {
+    // If it’s a short or question message, go to support; else instruct to use site button + support
+    if (/[?]/.test(text) || text.length < 50) {
+      return escalateToSupport(ctx, text);
+    }
+    return ctx.reply(
+      `Hmm, I couldn’t read that as an order. Please tap “Order Now” on our site so it pastes the correct summary with a reference.\n` +
+      `If you already have an order in progress, call ${SUPPORT_PHONE}.`
+    );
+  }
+
+  // New order session
   const ref = genRef();
   sessions.set(ctx.from.id, {
     ref, summary: text, status: 'AWAITING_PAYMENT', method: null,
@@ -640,8 +667,6 @@ bot.on('photo', async (ctx) => {
   ]);
 
   await ctx.telegram.sendPhoto(STAFF_GROUP_ID, fileId, { caption, ...actions });
-
-  // Full summary for staff (not to customer)
   await ctx.telegram.sendMessage(STAFF_GROUP_ID, `🧾 Order Summary (${s.ref}):\n${s.summary.slice(0, 4000)}`);
 
   await ctx.reply(`📸 Receipt received for ${s.ref}. We’re verifying it. You’ll get an update shortly.`);
