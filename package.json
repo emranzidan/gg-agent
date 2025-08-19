@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "dotenv": "^16.6.1",
+    "luxon": "^3.7.1",
     "telegraf": "^4.16.3"
   },
   "description": "",
