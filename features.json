@@ -1,0 +1,48 @@
+{
+  "_meta": {
+    "version": "1.0",
+    "desc": "Behavior toggles and timing knobs for EMMA. Safe to edit without touching code."
+  },
+
+  "time": {
+    "timezone": "Africa/Addis_Ababa",
+    "cutoffHourLocal": 18
+  },
+
+  "flows": {
+    "holdSeconds": 60,
+    "buttonTtlSeconds": 900,
+    "driverWindowMinutes": 30,
+    "driverGiveUpMinutes": 2,
+    "allowNewOrderWhileActive": true
+  },
+
+  "intake": {
+    "strictMode": true,
+    "escalateOnQuestion": true,
+    "minTextLength": 50
+  },
+
+  "support": {
+    "enabled": true,
+    "phone": "+251 2601986"
+  },
+
+  "flags": {
+    "flagDuplicateReceipts": true,
+    "flagForwardedReceipts": true,
+    "reReviewOnUndo": true,
+    "opsUnassignEnabled": false,
+    "sheetsExportEnabled": false
+  },
+
+  "ops": {
+    "approveScope": "members",
+    "rateLimitMs": 1500
+  },
+
+  "broadcast": {
+    "language": "am",
+    "shortCard": true
+  }
+}
