@@ -1,11 +1,13 @@
-// index.js — GreenGold EMMA (God Mode, modular)
+// index.js — GreenGold EMMA (God Mode, modular, Sheets-ready)
 // Reads behavior/text from: features.json, messages.json, drivers.json, and parser.js.
-// Keep this file STABLE. Most future tweaks happen in the JSONs or parser.js.
+// Keep this file STABLE. Most tweaks happen in the JSONs or parser.js.
+
+'use strict';
 
 // ─────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
 
 // Order detection / parsing brain
@@ -18,7 +20,7 @@ const {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Paths
-const ROOT = __dirname;
+const ROOT          = __dirname;
 const FEATURES_FILE = path.join(ROOT, 'features.json');
 const MESSAGES_FILE = path.join(ROOT, 'messages.json');
 const DRIVERS_FILE  = path.join(ROOT, 'drivers.json');
@@ -43,7 +45,7 @@ function loadFeatures() {
   // defaults
   FEATURES = {
     time: { timezone: 'Africa/Addis_Ababa', cutoffHourLocal: 18, ...(f.time || {}) },
-    flows: { holdSeconds: 60, buttonTtlSeconds: 900, driverWindowMinutes: 30, driverGiveUpMinutes: 2, allowNewOrderWhileActive: true, ...(f.flows || {}) },
+    flows: { holdSeconds: 60, buttonTtlSeconds: 900, driverWindowMinutes: 30, driverGiveUpMinutes: 2, allowNewOrderWhileActive: true, deepLinkTtlMs: 30*60*1000, ...(f.flows || {}) },
     intake: { strictMode: true, escalateOnQuestion: true, minTextLength: 50, ...(f.intake || {}) },
     support: { enabled: true, phone: '+251 2601986', ...(f.support || {}) },
     flags: { flagDuplicateReceipts: true, flagForwardedReceipts: true, reReviewOnUndo: true, opsUnassignEnabled: false, sheetsExportEnabled: false, ...(f.flags || {}) },
@@ -63,7 +65,7 @@ function loadDriversFromFile() {
     for (const d of arr) {
       const id = Number(d.id);
       if (!Number.isFinite(id)) continue;
-      const name = String(d.name || '').trim();
+      const name  = String(d.name  || '').trim();
       const phone = String(d.phone || '').trim();
       if (!name || !phone) continue;
       drivers.set(id, { id, name, phone });
@@ -74,6 +76,7 @@ function loadDriversFromFile() {
 function exportDriversJson() {
   return JSON.stringify([...drivers.values()].map(d => ({ id: d.id, name: d.name, phone: d.phone })), null, 2);
 }
+
 // Initial load
 loadFeatures();
 loadMessages();
@@ -88,27 +91,39 @@ const OWNER_IDS = String(process.env.OWNER_IDS || '')
   .split(',').map(s => Number(s.trim())).filter(n => Number.isFinite(n));
 if (OWNER_IDS.length === 0) console.warn('WARNING: OWNER_IDS not set.');
 
+// Chat IDs from env
 let STAFF_GROUP_ID   = process.env.STAFF_GROUP_ID   ? Number(process.env.STAFF_GROUP_ID)   : null;
 let SUPPORT_GROUP_ID = process.env.SUPPORT_GROUP_ID ? Number(process.env.SUPPORT_GROUP_ID) : null;
 
-const APPROVE_SCOPE     = (process.env.APPROVE_SCOPE || FEATURES.ops.approveScope || 'members').toLowerCase();
-const RATE_LIMIT_MS     = Number(process.env.RATE_LIMIT_MS || FEATURES.ops.rateLimitMs || 1500);
-const HOLD_SECONDS      = Number(process.env.HOLD_SECONDS || FEATURES.flows.holdSeconds || 60);
-const BUTTON_TTL_SEC    = Number(process.env.BUTTON_TTL_SEC || FEATURES.flows.buttonTtlSeconds || 900);
-const DRIVER_WINDOW_MS  = Number(process.env.DRIVER_WINDOW_MS || (FEATURES.flows.driverWindowMinutes * 60 * 1000));
-const GIVEUP_MS         = Number((FEATURES.flows.driverGiveUpMinutes || 2) * 60 * 1000);
-const ALLOW_NEW_ORDER   = !!FEATURES.flows.allowNewOrderWhileActive;
+// Sheets webhook env (optional)
+const SHEETS_URL    = process.env.SHEETS_WEBHOOK_URL || '';
+const SHEETS_SECRET = process.env.SHEETS_SECRET || '';
 
-const SUPPORT_ENABLED   = !!FEATURES.support.enabled;
-const SUPPORT_PHONE     = String(process.env.SUPPORT_PHONE || FEATURES.support.phone || '+251 2601986');
+// Derived runtime knobs (made let so /reload_texts can refresh)
+let APPROVE_SCOPE, RATE_LIMIT_MS, HOLD_SECONDS, BUTTON_TTL_SEC, DRIVER_WINDOW_MS, GIVEUP_MS, ALLOW_NEW_ORDER;
+let SUPPORT_ENABLED, SUPPORT_PHONE, DUP_FLAG, FWD_FLAG, RE_REVIEW_ON_UNDO, OPS_UNASSIGN_EN, TIMEZONE, CUTOFF_HOUR;
 
-const DUP_FLAG          = !!FEATURES.flags.flagDuplicateReceipts;
-const FWD_FLAG          = !!FEATURES.flags.flagForwardedReceipts;
-const RE_REVIEW_ON_UNDO = !!FEATURES.flags.reReviewOnUndo;
-const OPS_UNASSIGN_EN   = !!FEATURES.flags.opsUnassignEnabled;
+function refreshDerived() {
+  APPROVE_SCOPE   = String(process.env.APPROVE_SCOPE || FEATURES.ops.approveScope || 'members').toLowerCase();
+  RATE_LIMIT_MS   = Number(process.env.RATE_LIMIT_MS || FEATURES.ops.rateLimitMs || 1500);
+  HOLD_SECONDS    = Number(process.env.HOLD_SECONDS || FEATURES.flows.holdSeconds || 60);
+  BUTTON_TTL_SEC  = Number(process.env.BUTTON_TTL_SEC || FEATURES.flows.buttonTtlSeconds || 900);
+  DRIVER_WINDOW_MS= Number(process.env.DRIVER_WINDOW_MS || (FEATURES.flows.driverWindowMinutes * 60 * 1000));
+  GIVEUP_MS       = Number((FEATURES.flows.driverGiveUpMinutes || 2) * 60 * 1000);
+  ALLOW_NEW_ORDER = !!FEATURES.flows.allowNewOrderWhileActive;
 
-const TIMEZONE          = String(FEATURES.time.timezone || 'Africa/Addis_Ababa');
-const CUTOFF_HOUR       = Number(FEATURES.time.cutoffHourLocal || 18);
+  SUPPORT_ENABLED = !!FEATURES.support.enabled;
+  SUPPORT_PHONE   = String(process.env.SUPPORT_PHONE || FEATURES.support.phone || '+251 2601986');
+
+  DUP_FLAG        = !!FEATURES.flags.flagDuplicateReceipts;
+  FWD_FLAG        = !!FEATURES.flags.flagForwardedReceipts;
+  RE_REVIEW_ON_UNDO = !!FEATURES.flags.reReviewOnUndo;
+  OPS_UNASSIGN_EN = !!FEATURES.flags.opsUnassignEnabled;
+
+  TIMEZONE        = String(FEATURES.time.timezone || 'Africa/Addis_Ababa');
+  CUTOFF_HOUR     = Number(FEATURES.time.cutoffHourLocal || 18);
+}
+refreshDerived();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bot state
@@ -181,6 +196,22 @@ function setDriverTimer(ref) {
 }
 function clearDriverTimer(s) { if (s?.driverTimer) { clearTimeout(s.driverTimer); s.driverTimer = null; } }
 
+// Sheets poster (best-effort)
+async function postSheets(event, data = {}) {
+  if (!(SHEETS_URL && SHEETS_SECRET && FEATURES.flags.sheetsExportEnabled)) return;
+  try {
+    const payload = { secret: SHEETS_SECRET, event, ...data };
+    await fetch(SHEETS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    console.error('sheets post error', e.message);
+    if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, '⚠️ Sheets logging failed once.').catch(()=>{});
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Health & basics
 bot.start(async (ctx) => {
@@ -189,7 +220,7 @@ bot.start(async (ctx) => {
 
   if (payload && payload.startsWith('GG_')) {
     const tkn = tokens.get(payload);
-    if (!tkn || (now() - tkn.createdAt) > (FEATURES.flows.deepLinkTtlMs || 30 * 60 * 1000)) {
+    if (!tkn || (now() - tkn.createdAt) > Number(FEATURES.flows.deepLinkTtlMs || 30 * 60 * 1000)) {
       return ctx.reply('This link expired. Go back to our website and tap Order Now again.');
     }
     const ref = genRef();
@@ -327,13 +358,14 @@ bot.command('config_export', async (ctx) => {
     STAFF_GROUP_ID, SUPPORT_GROUP_ID, APPROVE_SCOPE, RATE_LIMIT_MS,
     HOLD_SECONDS, BUTTON_TTL_SEC, DRIVER_WINDOW_MS, GIVEUP_MS,
     TIMEZONE, CUTOFF_HOUR, drivers_loaded: drivers.size,
-    features_version: FEATURES._meta?.version || 'n/a'
+    features_version: FEATURES._meta?.version || 'n/a',
+    sheets_enabled: !!(SHEETS_URL && SHEETS_SECRET && FEATURES.flags.sheetsExportEnabled)
   };
   return ctx.reply('CONFIG:\n' + JSON.stringify(cfg, null, 2));
 });
 bot.command('reload_texts', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
-  loadMessages(); loadFeatures();
+  loadMessages(); loadFeatures(); refreshDerived();
   return ctx.reply('🔄 Reloaded messages.json & features.json.');
 });
 
@@ -389,7 +421,7 @@ bot.on('text', async (ctx) => {
     const note = maintenance.note ? ` (Note: ${maintenance.note})` : '';
     return ctx.reply((get(MSG,'customer.maintenance_on') || 'Maintenance.') + note);
   }
-  if (rateLimited(ctx.from.id)) return ctx.reply(get(MSG,'customer.rate_limited') || 'Slow down.');
+  if (rateLimited(ctx.from.id)) return ctx.reply(get(MSG,'customer.rate_limited') || 'Please wait a moment.');
 
   const text = ctx.message.text.trim();
   const isQ = isLikelyQuestion(text);
@@ -584,6 +616,23 @@ bot.on('callback_query', async (ctx, next) => {
           }));
         }
         await bot.telegram.sendMessage(refs.get(s.ref), t('customer.driver_assigned', { REF: s.ref, DRIVER_NAME: d ? d.name : 'Assigned driver', DRIVER_PHONE: d ? d.phone : '—' }));
+
+        // Sheets: assigned
+        const f2 = parseOrderFields(s.summary);
+        await postSheets('assigned', {
+          ref: s.ref,
+          customer_name: f2.customerName || '',
+          phone: f2.phone || '',
+          area: f2.area || '',
+          map_url: f2.map || '',
+          total_etb: f2.total || '',
+          delivery_fee: f2.delivery || '',
+          payment_method: s.method || '',
+          driver_id: d ? d.id : ctx.from.id,
+          driver_name: d ? d.name : '',
+          driver_phone: d ? d.phone : '',
+          status: 'ASSIGNED'
+        });
         return;
       } else {
         return ctx.answerCbQuery(get(MSG,'driver.declined_ok') || 'Declined. Thanks.');
@@ -620,6 +669,24 @@ bot.on('callback_query', async (ctx, next) => {
         await ctx.answerCbQuery(get(MSG,'driver.delivered_marked') || 'Delivered.');
         if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.delivered', { REF: s.ref, USER_ID: ctx.from.id }));
         await bot.telegram.sendMessage(refs.get(s.ref), t('customer.delivered', { REF: s.ref })).catch(()=>{});
+
+        // Sheets: delivered
+        const f3 = parseOrderFields(s.summary);
+        const dInfo2 = drivers.get(ctx.from.id);
+        await postSheets('delivered', {
+          ref: s.ref,
+          customer_name: f3.customerName || '',
+          phone: f3.phone || '',
+          area: f3.area || '',
+          map_url: f3.map || '',
+          total_etb: f3.total || '',
+          delivery_fee: f3.delivery || '',
+          payment_method: s.method || '',
+          driver_id: dInfo2 ? dInfo2.id : ctx.from.id,
+          driver_name: dInfo2 ? dInfo2.name : '',
+          driver_phone: dInfo2 ? dInfo2.phone : '',
+          status: 'DELIVERED'
+        });
         return;
       }
     }
@@ -642,6 +709,21 @@ async function finalizeApproval(s, uid) {
     }
     await bot.telegram.sendMessage(uid, t('customer.payment_confirmed_after_hold', { REF: s.ref }));
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.dispatching_notice', { REF: s.ref }));
+
+    // Sheets: approved
+    const f = parseOrderFields(s.summary);
+    await postSheets('approved', {
+      ref: s.ref,
+      customer_name: f.customerName || '',
+      phone: f.phone || '',
+      area: f.area || '',
+      map_url: f.map || '',
+      total_etb: f.total || '',
+      delivery_fee: f.delivery || '',
+      payment_method: s.method || '',
+      status: 'APPROVED'
+    });
+
     await broadcastToDrivers(s);
     setDriverTimer(s.ref);
   } catch (err) {
@@ -696,7 +778,10 @@ bot.on('photo', async (ctx) => {
   ]);
 
   await ctx.telegram.sendPhoto(STAFF_GROUP_ID, fileId, { caption, ...actions });
-  await ctx.telegram.sendMessage(STAFF_GROUP_ID, (get(MSG,'staff.order_summary_prefix') || '🧾 Order Summary:\n').replace('{REF}', s.ref) + s.summary.slice(0, 4000));
+  await ctx.telegram.sendMessage(
+    STAFF_GROUP_ID,
+    (get(MSG,'staff.order_summary_prefix') || '🧾 Order Summary:\n').replace('{REF}', s.ref) + s.summary.slice(0, 4000)
+  );
   await ctx.reply(t('customer.receipt_received', { REF: s.ref }));
 });
 
@@ -750,4 +835,3 @@ async function broadcastToDrivers(s, excludeId = null) {
 bot.launch().then(() => console.log('Polling started…'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
