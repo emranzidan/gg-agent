@@ -1,0 +1,99 @@
+{
+  "_meta": {
+    "version": "1.0",
+    "placeholders": [
+      "{REF}",
+      "{TOTAL}",
+      "{METHOD}",
+      "{CUSTOMER_NAME}",
+      "{USERNAME}",
+      "{USER_ID}",
+      "{AREA}",
+      "{MAP_URL}",
+      "{QTY}",
+      "{DELIVERY_FEE}",
+      "{DRIVER_NAME}",
+      "{DRIVER_PHONE}",
+      "{MINUTES}",
+      "{SUPPORT_PHONE}"
+    ]
+  },
+
+  "buttons": {
+    "payment_telebirr": "Telebirr",
+    "payment_cbe": "CBE Bank",
+    "approve": "Approve ✅",
+    "reject": "Reject ❌",
+    "undo_hold": "Undo (60s)",
+    "drv_accept_am": "✅ ተቀበል",
+    "drv_decline_am": "❌ አትቀበል",
+    "drv_picked_am": "✔ ተነሳ",
+    "drv_done_am": "✔✔ ተደረሰ",
+    "drv_giveup_am": "እተዋለሁ",
+    "support_claim": "I’ll handle"
+    },
+
+  "customer": {
+    "welcome": "🌿 Welcome to Green Gold.\n🧾 Got your order. Ref {REF}. Choose a payment method:",
+    "welcome_after_cutoff": "🌿 Welcome to Green Gold.\n🧾 Got your order. Ref {REF}. Choose a payment method:\n🕕 Orders placed after 6 pm will be delivered in the morning.",
+    "invalid_intake": "Hmm, I couldn’t read that as an order. Please tap “Order Now” on our site so it pastes the correct summary with a reference.\nIf you already have an order in progress, call {SUPPORT_PHONE}.",
+    "existing_awaiting_payment_nudge": "You already started order {REF}. Please tap a payment method above (Telebirr or CBE).",
+    "awaiting_receipt_text": "Please attach a clear screenshot of the payment receipt here.",
+    "receipt_received": "📸 Receipt received for {REF}. We’re verifying it. You’ll get an update shortly.",
+    "payment_info_telebirr": "💳 Telebirr payment\nSend {TOTAL} ETB and reply here with a clear screenshot of the receipt.",
+    "payment_info_cbe": "🏦 CBE Bank payment\nSend {TOTAL} ETB and reply here with a clear screenshot of the receipt.",
+    "payment_confirmed_after_hold": "✅ Payment confirmed for {REF}. We’re assigning a driver now.",
+    "payment_rejected": "❌ We couldn’t verify the receipt for {REF}.\nPlease send a clear screenshot (full screen, readable).\nIf you need help, call {SUPPORT_PHONE}.",
+    "driver_assigned": "🚗 Your order {REF} is on the way.\nDriver: {DRIVER_NAME} — {DRIVER_PHONE}.",
+    "picked_up": "📦 {REF} picked up. On the way to you.",
+    "delivered": "✅ {REF} delivered. Enjoy your coffee!",
+    "no_driver_delay": "⏱️ We’re finding a driver for {REF}. Slight delay in finding the driver.",
+    "support_forward_ack": "We’ve forwarded your message to a support teammate. If urgent, call {SUPPORT_PHONE}.",
+    "order_in_progress_note": "Order {REF} is in progress. For changes or questions, reply here or call {SUPPORT_PHONE}.",
+    "rate_limited": "Please wait a moment before sending another message.",
+    "maintenance_on": "We’re temporarily paused for maintenance. Please try again shortly.",
+    "cancel_done": "🧹 Your current order flow was canceled. You can paste a new order summary anytime."
+  },
+
+  "staff": {
+    "method_selected": "ℹ️ Payment method selected\nRef: {REF}\nMethod: {METHOD}\nCustomer: {CUSTOMER_NAME} ({USERNAME})",
+    "receipt_caption": "📸 Payment screenshot received\nRef: {REF}\nMethod: {METHOD}\nFrom: {CUSTOMER_NAME} ({USERNAME})\nTelegram ID: {USER_ID}",
+    "receipt_flags_prefix": "Flags:",
+    "order_summary_prefix": "🧾 Order Summary ({REF}):\n",
+    "approved_on_hold_caption": "📸 Payment screenshot received\nRef: {REF}\nStatus: ✅ Approved (on hold 60s)",
+    "approved_hold_message": "✅ Approved — Ref: {REF}\n⏳ Holding 60s before notifying customer.\nTap Undo to cancel.",
+    "approval_undone_message": "↩️ Approval undone — Ref: {REF}\nCustomer was NOT notified.",
+    "re_review_prompt": "Re-review needed — Ref: {REF}\nChoose an action:",
+    "rejected_caption": "📸 Payment screenshot received\nRef: {REF}\nStatus: ❌ Rejected",
+    "rejected_notice": "❌ Rejected\nRef: {REF}\nCustomer notified to resend.",
+    "dispatching_notice": "📣 Dispatching to drivers…\nRef: {REF}",
+    "driver_accepted": "🚗 Driver accepted\nRef: {REF}\nDriver: {DRIVER_NAME} ({DRIVER_PHONE}) [{USER_ID}]",
+    "picked_up": "📦 Picked up\nRef: {REF}\nDriver: {USER_ID}",
+    "delivered": "✅ Delivered\nRef: {REF}\nDriver: {USER_ID}",
+    "no_driver_ping": "⏳ No driver accepted within {MINUTES} minutes.\nRef: {REF}\nPlease assign manually.",
+    "broadcast_report": "Driver broadcast sent.\nRef: {REF}\n✅ Sent: {SENT}\n⚠️ Failed (DM first): {FAILED}",
+    "broadcast_failed_hint": "⚠️ Could not DM {COUNT} driver(s). They must DM the bot at least once.",
+    "action_expired": "⛔ Action expired — Ref: {REF}",
+    "finalize_approved": "✅ Approved — Ref: {REF}\nHold finished. Notifying customer and dispatching.",
+    "driver_canceled_rebroadcast": "⚠️ Driver canceled — Ref: {REF}. Re-broadcasting to others (excluding {USER_ID})."
+  },
+
+  "driver": {
+    "broadcast_card_am": "🛵 አዲስ ስራ — {REF}\nብዛት: {QTY}\nቦታ: {AREA}\nጠቅላላ ዋጋ: {TOTAL} ETB\nጭነት የሞተር ሂሳብ: {DELIVERY_FEE}\n{MAP_LINE}\n\n(ቁልፎችን ይጠቀሙ)",
+    "broadcast_map_line_am": "ቦታ: {MAP_URL}",
+    "assigned_card_am": "✅ ስራ ተመድቧል (Assigned)\nRef: {REF}\n\nብዛት: {QTY}\nቦታ: {AREA}\nጠቅላላ ዋጋ: {TOTAL} ETB\nጭነት የሞተር ሂሳብ: {DELIVERY_FEE}\n{MAP_LINE}\n\n(ከታች ያሉ ቁልፎችን ይጠቀሙ)",
+    "accept_you_already_have": "You already have this job.",
+    "accept_already_assigned": "Already assigned.",
+    "declined_ok": "Declined. Thanks.",
+    "picked_marked": "Marked picked up.",
+    "delivered_marked": "Marked delivered. Thank you!",
+    "giveup_too_late": "Give up window has expired.",
+    "giveup_ok": "You’ve given up this job."
+  },
+
+  "support": {
+    "escalation_post": "🆘 Customer Help Needed\nUser: {CUSTOMER_NAME} ({USERNAME})\nTelegram ID: {USER_ID}\nMessage:\n_{MESSAGE}_",
+    "claimed_suffix": "🟢 {CLAIMER_NAME} is handling.",
+    "customer_claim_dm": "👋 A team member is on it. If you need to call, {SUPPORT_PHONE}."
+  }
+}
