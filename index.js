@@ -1,23 +1,11 @@
-// GreenGold EMMA — v2.2 "Undo Re-Review + Smarter Intake"
-// ─────────────────────────────────────────────────────────────────────────────
-// NEW IN THIS PATCH
-// • After staff taps Undo (within 60s), bot posts fresh Approve/Reject buttons for the same REF
-//   and resets TTL (createdAt = now()) so actions don’t “expire” immediately.
-// • Sticky session smarter:
-//   - If user is AWAITING_PAYMENT and sends random text → remind to pick a method (no auto buttons spam).
-//   - If they ask a question (“?”, “help”, “support”) → escalate to Support.
-//   - Added /cancel to clear current session cleanly.
-// • Keeps v2.1/v2.0 features: strict order detection, 6pm line, 60s hold+undo, give-up, TTL,
-//   receipt flags, no-driver nudge, Amharic driver card, owner overrides, (optional) Sheets logging.
-//
-// DROP-IN: paste over existing index.js and deploy.
-//
-// ENV keys: same as v2.1 (BOT_TOKEN, OWNER_IDS, STAFF_GROUP_ID, SUPPORT_GROUP_ID, APPROVE_SCOPE,
-// DRIVER_WINDOW_MS, DEEP_LINK_TTL_MS, BUTTON_TTL_SEC, TELEBIRR_TEXT, BANK_TEXT, SUPPORT_PHONE,
-// ENABLE_SHEETS_EXPORT, SHEETS_WEBHOOK_URL)
+// GreenGold EMMA — v2.3 "JSON Drivers Persist"
+// Adds: drivers.json persistence (+ /drivers_reload, /drivers_export), env fallback DRIVERS_SEED
+// Keeps: v2.2 features — strict intake, 6pm note, hold+undo (re-review), give-up + re-broadcast, TTL, support escalation, flags, owner overrides.
 
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
+const fs = require('fs');
+const path = require('path');
 
 // ---------- Required config ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -41,6 +29,8 @@ const SUPPORT_PHONE    = (process.env.SUPPORT_PHONE || '+251 2601986');
 const ENABLE_SHEETS_EXPORT = String(process.env.ENABLE_SHEETS_EXPORT || 'false').toLowerCase() === 'true';
 const SHEETS_WEBHOOK_URL   = process.env.SHEETS_WEBHOOK_URL || '';
 
+const DRIVERS_SEED_ENV = process.env.DRIVERS_SEED || ''; // optional JSON string fallback
+
 // ---------- Optional texts ----------
 let TELEBIRR_TEXT = (process.env.TELEBIRR_TEXT || `Telebirr Merchant: Green Gold Ethiopia plc
 Merchant ID: 86555
@@ -56,12 +46,12 @@ Branch: Bambis Branch
 Please send a clear screenshot of your payment receipt here.`).trim();
 
 // ---------- In-memory stores ----------
-const sessions = new Map();   // uid -> { ref, summary, status, method, assigned_driver_id, driverTimer, approvalTimer, holdMsgId, giveupUntil, createdAt }
+const sessions = new Map();   // uid -> {...}
 const refs     = new Map();   // ref -> uid
-const tokens   = new Map();   // deep-link test tokens
+const tokens   = new Map();
 const drivers  = new Map();   // driver_id -> { id, name, phone }
 let maintenance = { on: false, note: '' };
-const userRate = new Map();   // uid -> lastTs
+const userRate = new Map();
 const seenReceiptIds = new Set();
 const orderLog = [];
 
@@ -72,42 +62,26 @@ const isGroup   = (ctx) => ['group','supergroup'].includes(ctx.chat?.type);
 const isOwner   = (ctx) => OWNER_IDS.includes(ctx.from?.id);
 const clean     = (s='') => s.replace(/\s+/g, ' ').trim();
 
-function genRef() {
-  let ref;
-  do { ref = 'GG_' + Math.random().toString(36).slice(2, 6).toUpperCase(); } while (refs.has(ref));
-  return ref;
-}
+function genRef() { let ref; do { ref = 'GG_' + Math.random().toString(36).slice(2, 6).toUpperCase(); } while (refs.has(ref)); return ref; }
 function now() { return Date.now(); }
 function getSessionByRef(ref) { const uid = refs.get(ref); return uid ? sessions.get(uid) : null; }
 function ttlExpired(s) { return !s || (now() - s.createdAt) > (BUTTON_TTL_SEC * 1000); }
-
-function isAfter6pmAddis() {
-  const utcHour = new Date().getUTCHours();
-  const addisHour = (utcHour + 3) % 24;
-  return addisHour >= 18;
-}
+function isAfter6pmAddis() { const utcHour = new Date().getUTCHours(); return ((utcHour + 3) % 24) >= 18; }
 function composeWelcomeEcho(ref) {
   const base = `🌿 Welcome to Green Gold.\n🧾 Got your order. Ref ${ref}. Choose a payment method:`;
-  return isAfter6pmAddis()
-    ? `${base}\n🕕 Orders placed after 6 pm will be delivered in the morning.`
-    : base;
+  return isAfter6pmAddis() ? `${base}\n🕕 Orders placed after 6 pm will be delivered in the morning.` : base;
 }
-
-// Strict detector tuned to your format
-const REF_PATTERN   = /\bGG-\d{8}-\d{6}-[A-Z0-9]{4}\b/;           // GG-YYYYMMDD-HHMMSS-XXXX
-const ORDER_HEADER  = /(?:^|\n)\s*🧾\s*Order ID:\s*GG-/i;         // 🧾 Order ID: GG-...
+const REF_PATTERN   = /\bGG-\d{8}-\d{6}-[A-Z0-9]{4}\b/;
+const ORDER_HEADER  = /(?:^|\n)\s*🧾\s*Order ID:\s*GG-/i;
 const HAS_TOTAL     = /\bTotal:\s*ETB\s*\d/i;
 const HAS_ETB       = /\bETB\b/i;
 const HAS_QTY       = /\b(Qty|Quantity)\b|\bx\s*\d+/i;
-
 function isOrderSummaryStrict(text) {
-  const t = text || '';
-  if (t.length < 50) return false;
+  const t = text || ''; if (t.length < 50) return false;
   const byHeader  = ORDER_HEADER.test(t) && REF_PATTERN.test(t) && (HAS_TOTAL.test(t) || HAS_ETB.test(t));
   const bySignals = REF_PATTERN.test(t) && HAS_ETB.test(t) && HAS_QTY.test(t);
   return byHeader || bySignals;
 }
-
 function parseOrderFields(text) {
   const t = text || '';
   let qty = (t.match(/\bqty[:\s]*([0-9]+)\b/i) || t.match(/\bx\s*([0-9]+)\b/i) || t.match(/\bitems?[:\s]*([0-9]+)\b/i) || [,'—'])[1];
@@ -122,30 +96,17 @@ function parseOrderFields(text) {
   if (phone && phone.startsWith('0')) phone = '+251' + phone.slice(1);
   return { qty: qty || '—', total: total || '—', delivery: delivery || '—', area: area || '—', map: map || '—', phone: phone || '' };
 }
-
 async function isGroupAdmin(ctx) {
-  try {
-    if (!isGroup(ctx)) return false;
-    const m = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-    return m.status === 'creator' || m.status === 'administrator';
-  } catch { return false; }
+  try { if (!isGroup(ctx)) return false; const m = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id); return m.status==='creator'||m.status==='administrator'; }
+  catch { return false; }
 }
-async function canApprove(ctx) {
-  if (!isGroup(ctx) || ctx.chat.id !== STAFF_GROUP_ID) return false;
-  if (APPROVE_SCOPE === 'admins') return isGroupAdmin(ctx);
-  return true;
-}
+async function canApprove(ctx) { if (!isGroup(ctx) || ctx.chat.id !== STAFF_GROUP_ID) return false; return APPROVE_SCOPE==='admins' ? isGroupAdmin(ctx) : true; }
 function setDriverTimer(ref) {
-  const s = getSessionByRef(ref);
-  if (!s) return;
-  clearDriverTimer(s);
+  const s = getSessionByRef(ref); if (!s) return; clearDriverTimer(s);
   s.driverTimer = setTimeout(async () => {
     const still = getSessionByRef(ref);
     if (still && !still.assigned_driver_id && still.status === 'DISPATCHING' && STAFF_GROUP_ID) {
-      await bot.telegram.sendMessage(
-        STAFF_GROUP_ID,
-        `⏳ No driver accepted within ${Math.round(DRIVER_WINDOW_MS/60000)} minutes.\nRef: ${ref}\nPlease assign manually.`
-      );
+      await bot.telegram.sendMessage(STAFF_GROUP_ID, `⏳ No driver accepted within ${Math.round(DRIVER_WINDOW_MS/60000)} minutes.\nRef: ${ref}\nPlease assign manually.`);
       const uid = refs.get(ref);
       if (uid) await bot.telegram.sendMessage(uid, `⏱️ We’re finding a driver for ${ref}. Slight delay in finding the driver.`);
       logMilestone('no_driver', still, { result: 'no_driver' }).catch(()=>{});
@@ -153,14 +114,45 @@ function setDriverTimer(ref) {
   }, DRIVER_WINDOW_MS);
 }
 function clearDriverTimer(s) { if (s?.driverTimer) { clearTimeout(s.driverTimer); s.driverTimer = null; } }
-function rateLimited(uid, minMs = 1500) {
-  const last = userRate.get(uid) || 0;
-  const ok = now() - last >= minMs;
-  if (ok) userRate.set(uid, now());
-  return !ok;
-}
+function rateLimited(uid, minMs = 1500) { const last = userRate.get(uid) || 0; const ok = now()-last>=minMs; if (ok) userRate.set(uid, now()); return !ok; }
 function maskUsername(u) { return u ? '@' + u : 'no_username'; }
 
+// ---- Drivers.json persistence ----
+const DRIVERS_FILE = path.join(__dirname, 'drivers.json');
+function loadDriversFromJsonString(jsonStr) {
+  try {
+    const arr = JSON.parse(jsonStr);
+    if (!Array.isArray(arr)) throw new Error('not array');
+    drivers.clear();
+    for (const d of arr) {
+      const id = Number(d.id); if (!Number.isFinite(id)) continue;
+      const name = String(d.name || '').trim(); const phone = String(d.phone || '').trim();
+      if (!name || !phone) continue;
+      drivers.set(id, { id, name, phone });
+    }
+    return { ok: true, count: drivers.size };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+function loadDriversFromFile() {
+  try {
+    if (!fs.existsSync(DRIVERS_FILE)) return { ok: false, error: 'drivers.json not found' };
+    const raw = fs.readFileSync(DRIVERS_FILE, 'utf8');
+    return loadDriversFromJsonString(raw);
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+function exportDriversJson() {
+  const arr = [...drivers.values()].map(d => ({ id: d.id, name: d.name, phone: d.phone }));
+  return JSON.stringify(arr, null, 2);
+}
+// Prime drivers on boot — file first, then env fallback
+(function primeDrivers() {
+  let res = loadDriversFromFile();
+  if (!res.ok && DRIVERS_SEED_ENV) res = loadDriversFromJsonString(DRIVERS_SEED_ENV);
+  if (res.ok) console.log(`Drivers loaded: ${res.count}`);
+  else console.log(`Drivers not loaded: ${res.error || 'none found'}`);
+})();
+
+// Sheets logging (optional)
 async function logMilestone(milestone, s, extra = {}) {
   try {
     const customer_id = refs.get(s.ref);
@@ -232,7 +224,7 @@ bot.command('approverule', async (ctx) => {
 });
 
 // Payment text management
-const waitFor = new Map(); // chat_id -> 'telebirr'|'bank'
+const waitFor = new Map();
 bot.command('settelebirr', async (ctx) => { if (!isOwner(ctx) || !isPrivate(ctx)) return; waitFor.set(ctx.chat.id, 'telebirr'); ctx.reply('Send the new Telebirr text as your next message.'); });
 bot.command('setbank',     async (ctx) => { if (!isOwner(ctx) || !isPrivate(ctx)) return; waitFor.set(ctx.chat.id, 'bank');     ctx.reply('Send the new Bank text as your next message.'); });
 bot.command('getpay',      async (ctx) => { if (!isOwner(ctx) || !isPrivate(ctx)) return; ctx.reply(`Telebirr:\n${TELEBIRR_TEXT}\n\nBank:\n${BANK_TEXT}`); });
@@ -241,13 +233,12 @@ bot.on('text', async (ctx, next) => {
   if (pending && isPrivate(ctx) && isOwner(ctx)) {
     if (pending === 'telebirr') { TELEBIRR_TEXT = ctx.message.text.trim(); await ctx.reply('✅ Telebirr text updated.'); }
     if (pending === 'bank')     { BANK_TEXT = ctx.message.text.trim();     await ctx.reply('✅ Bank text updated.'); }
-    waitFor.delete(ctx.chat.id);
-    return;
+    waitFor.delete(ctx.chat.id); return;
   }
   return next();
 });
 
-// Drivers mgmt
+// Drivers mgmt (with persistence tips)
 bot.command('adddriver', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   const raw = ctx.message.text.split(' ').slice(1).join(' ');
@@ -255,13 +246,13 @@ bot.command('adddriver', async (ctx) => {
   const parts = raw.split('|').map(x => clean(x));
   if (parts.length < 3) return ctx.reply('Format:\n/adddriver <tg_id> | <full name> | <phone>');
   const id = Number(parts[0]); const name = parts[1]; const phone = parts[2];
-  if (!Number.isFinite(id)) return ctx.reply('tg_id must be a number. Example:\n/adddriver 7138336029 | Abebe | +971 524711872');
+  if (!Number.isFinite(id)) return ctx.reply('tg_id must be a number. Example:\n/adddriver 7138336029 | Abebe | +251 911111111');
   drivers.set(id, { id, name, phone });
-  return ctx.reply(`✅ Driver added:\n• ID: ${id}\n• Name: ${name}\n• Phone: ${phone}`);
+  return ctx.reply(`✅ Driver added:\n• ID: ${id}\n• Name: ${name}\n• Phone: ${phone}\n\nTo persist after restart: edit drivers.json in the repo and deploy, or use /drivers_export to get JSON to paste.`);
 });
 bot.command('drivers', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
-  if (drivers.size === 0) return ctx.reply('No drivers yet. Add one:\n/adddriver 7138336029 | Abebe | +971 524711872');
+  if (drivers.size === 0) return ctx.reply('No drivers yet. Add one:\n/adddriver 7138336029 | Abebe | +251 911111111');
   const list = [...drivers.values()].map(d => `• ${d.name} — ${d.phone} (id ${d.id})`).join('\n');
   return ctx.reply(`Drivers:\n${list}`);
 });
@@ -271,7 +262,27 @@ bot.command('removedriver', async (ctx) => {
   if (!Number.isFinite(id)) return ctx.reply('Format:\n/removedriver <tg_id>');
   if (!drivers.has(id)) return ctx.reply(`No driver with id ${id}.`);
   drivers.delete(id);
-  return ctx.reply(`✅ Driver removed: ${id}`);
+  return ctx.reply(`✅ Driver removed: ${id}\n\nTo persist after restart: remove them in drivers.json and deploy (or update via /drivers_export).`);
+});
+// Reload drivers.json from disk
+bot.command('drivers_reload', async (ctx) => {
+  if (!isOwner(ctx) || !isPrivate(ctx)) return;
+  const res = loadDriversFromFile();
+  if (res.ok) return ctx.reply(`🔄 Reloaded drivers.json — ${res.count} drivers.`);
+  return ctx.reply(`⚠️ Could not reload drivers.json: ${res.error || 'unknown error'}`);
+});
+// Export current drivers as JSON (to paste into drivers.json)
+bot.command('drivers_export', async (ctx) => {
+  if (!isOwner(ctx) || !isPrivate(ctx)) return;
+  const json = exportDriversJson();
+  if (json.length > 3500) {
+    // split into chunks to avoid telegram limits
+    const chunks = json.match(/[\s\S]{1,3500}/g) || [json];
+    await ctx.reply(`Current drivers JSON (${chunks.length} part(s)) — paste into drivers.json:`);
+    for (const part of chunks) await ctx.reply(part);
+    return;
+  }
+  return ctx.reply(json);
 });
 
 // Owner overrides
@@ -281,12 +292,12 @@ bot.command('revert', async (ctx) => {
   const s = getSessionByRef(ref);
   if (!s) return ctx.reply('Ref not found.');
   const uid = refs.get(ref);
-  if (uid) refs.set(ref, uid); // no-op, ensures mapping stays
+  if (uid) refs.set(ref, uid);
   s.status = 'AWAITING_RECEIPT';
   s.assigned_driver_id = null;
   s.giveupUntil = null;
   clearDriverTimer(s);
-  s.createdAt = now(); // refresh TTL
+  s.createdAt = now();
   return ctx.reply(`↩️ Reverted order ${ref} to AWAITING_RECEIPT.`);
 });
 bot.command('forceapprove', async (ctx) => {
@@ -305,7 +316,8 @@ bot.command('config_export', async (ctx) => {
   const cfg = {
     STAFF_GROUP_ID, SUPPORT_GROUP_ID, APPROVE_SCOPE, DRIVER_WINDOW_MS, BUTTON_TTL_SEC,
     ENABLE_SHEETS_EXPORT, SHEETS_WEBHOOK_URL: SHEETS_WEBHOOK_URL ? '[set]' : '[unset]',
-    TELEBIRR_TEXT_len: TELEBIRR_TEXT.length, BANK_TEXT_len: BANK_TEXT.length
+    TELEBIRR_TEXT_len: TELEBIRR_TEXT.length, BANK_TEXT_len: BANK_TEXT.length,
+    drivers_loaded: drivers.size
   };
   return ctx.reply('CONFIG:\n' + JSON.stringify(cfg, null, 2));
 });
@@ -363,29 +375,22 @@ bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   const isQuestion = /[?]|help|support/i.test(text);
 
-  // Sticky session: don’t misroute mid-flow
   const existing = sessions.get(ctx.from.id);
   if (existing) {
-    if (existing.status === 'AWAITING_RECEIPT') {
-      return ctx.reply('Please attach a clear screenshot of the payment receipt here.');
-    }
+    if (existing.status === 'AWAITING_RECEIPT') return ctx.reply('Please attach a clear screenshot of the payment receipt here.');
     if (existing.status === 'AWAITING_PAYMENT') {
       if (isQuestion) return escalateToSupport(ctx, text);
-      // gentle nudge (no auto keyboard spam)
       return ctx.reply(`You already started order ${existing.ref}. Please tap a payment method above (Telebirr or CBE).`);
     }
-    // Active delivery states → treat messages as support unless they paste a brand-new summary
     if (!isOrderSummaryStrict(text)) {
       if (isQuestion || text.length < 50) return escalateToSupport(ctx, text);
       return ctx.reply(`Order ${existing.ref} is in progress. For changes or questions, reply here or call ${SUPPORT_PHONE}.`);
     }
-    // If they paste a new valid summary mid-flow, start a new session (optional). Here we’ll allow it:
-    // first, clear previous mapping (soft reset)
+    // Starting a new summary mid-flow: reset and accept new order
     refs.delete(existing.ref);
     sessions.delete(ctx.from.id);
   }
 
-  // Strict intake: require real order summary
   if (!isOrderSummaryStrict(text)) {
     if (isQuestion || text.length < 50) return escalateToSupport(ctx, text);
     return ctx.reply(
@@ -394,7 +399,6 @@ bot.on('text', async (ctx) => {
     );
   }
 
-  // New order session
   const ref = genRef();
   sessions.set(ctx.from.id, {
     ref, summary: text, status: 'AWAITING_PAYMENT', method: null,
@@ -402,7 +406,6 @@ bot.on('text', async (ctx) => {
     holdMsgId: null, giveupUntil: null, createdAt: now()
   });
   refs.set(ref, ctx.from.id);
-
   await sendSummaryWithPay(ctx, text, ref);
 });
 
@@ -423,74 +426,55 @@ bot.on('callback_query', async (ctx, next) => {
       return ctx.answerCbQuery('Claimed.');
     }
 
-    // Customer selects payment method
+    // Payment choice
     if (data.startsWith('pay:')) {
       const [, method, ref] = data.split(':');
       const s = getSessionByRef(ref);
       if (!s) return ctx.answerCbQuery('No active order.');
       s.method = method.toUpperCase();
       s.status = 'AWAITING_RECEIPT';
-
       await ctx.reply(method === 'telebirr' ? TELEBIRR_TEXT : BANK_TEXT);
       await ctx.answerCbQuery('Payment info sent.');
-
       if (STAFF_GROUP_ID) {
-        await ctx.telegram.sendMessage(
-          STAFF_GROUP_ID,
-          `ℹ️ Payment method selected\nRef: ${s.ref}\nMethod: ${s.method}\nCustomer: ${ctx.from.first_name || ''} ${ctx.from.last_name || ''} (${maskUsername(ctx.from.username)})`
-        );
+        await ctx.telegram.sendMessage(STAFF_GROUP_ID, `ℹ️ Payment method selected\nRef: ${s.ref}\nMethod: ${s.method}\nCustomer: ${ctx.from.first_name || ''} ${ctx.from.last_name || ''} (${maskUsername(ctx.from.username)})`);
       }
       return;
     }
 
-    // Group Approve / Reject / Undo
+    // Approve/Reject/Undo (staff)
     if (data.startsWith('approve:') || data.startsWith('reject:') || data.startsWith('undo:')) {
       if (!isGroup(ctx)) return ctx.answerCbQuery('Use inside staff group.');
       if (!STAFF_GROUP_ID || ctx.chat.id !== STAFF_GROUP_ID) return ctx.answerCbQuery('Wrong group.');
       if (!(await canApprove(ctx))) return ctx.answerCbQuery('Not authorized.');
 
-      // Undo path: re-open Approve/Reject and refresh TTL
       if (data.startsWith('undo:')) {
         const ref = data.split(':')[1];
         const s = getSessionByRef(ref);
         if (!s || s.status !== 'APPROVED_HOLD') return ctx.answerCbQuery('Nothing to undo.');
         if (s.approvalTimer) { clearTimeout(s.approvalTimer); s.approvalTimer = null; }
         s.status = 'AWAITING_RECEIPT';
-        s.assigned_driver_id = null;
-        s.giveupUntil = null;
+        s.assigned_driver_id = null; s.giveupUntil = null;
         s.createdAt = now(); // refresh TTL
         if (s.holdMsgId) {
           const doneText = `↩️ Approval undone — Ref: ${s.ref}\nCustomer was NOT notified.`;
           await bot.telegram.editMessageText(STAFF_GROUP_ID, s.holdMsgId, undefined, doneText).catch(()=>{});
         }
         const uid = refs.get(ref);
-        const reKb = Markup.inlineKeyboard([
-          [Markup.button.callback('Approve ✅', `approve:${uid}:${s.ref}`), Markup.button.callback('Reject ❌', `reject:${uid}:${s.ref}`)]
-        ]);
+        const reKb = Markup.inlineKeyboard([[Markup.button.callback('Approve ✅', `approve:${uid}:${s.ref}`), Markup.button.callback('Reject ❌', `reject:${uid}:${s.ref}`)]]);
         await bot.telegram.sendMessage(STAFF_GROUP_ID, `Re-review needed — Ref: ${s.ref}\nChoose an action:`, reKb);
         return ctx.answerCbQuery('Approval undone.');
       }
 
-      // Approve/Reject normal
       const [verb, userId, ref] = data.split(':');
       const uid = Number(userId);
       const s = getSessionByRef(ref) || sessions.get(uid);
       if (!s || s.ref !== ref) return ctx.answerCbQuery('Order not found.');
-
-      if (ttlExpired(s)) {
-        await ctx.answerCbQuery('This action expired for this order.');
-        await ctx.telegram.sendMessage(STAFF_GROUP_ID, `⛔ Action expired — Ref: ${ref}`);
-        return;
-      }
+      if (ttlExpired(s)) { await ctx.answerCbQuery('This action expired for this order.'); await ctx.telegram.sendMessage(STAFF_GROUP_ID, `⛔ Action expired — Ref: ${ref}`); return; }
 
       if (verb === 'approve') {
         s.status = 'APPROVED_HOLD';
         await ctx.editMessageCaption({ caption: `📸 Payment screenshot received\nRef: ${s.ref}\nStatus: ✅ Approved (on hold 60s)` }).catch(()=>{});
-        const holdMsg = await ctx.telegram.sendMessage(
-          STAFF_GROUP_ID,
-          `✅ Approved — Ref: ${s.ref}\n⏳ Holding 60s before notifying customer.\nTap Undo to cancel.`,
-          Markup.inlineKeyboard([[Markup.button.callback('Undo (60s)', `undo:${s.ref}`)]])
-        );
+        const holdMsg = await ctx.telegram.sendMessage(STAFF_GROUP_ID, `✅ Approved — Ref: ${s.ref}\n⏳ Holding 60s before notifying customer.\nTap Undo to cancel.`, Markup.inlineKeyboard([[Markup.button.callback('Undo (60s)', `undo:${s.ref}`)]]));
         s.holdMsgId = holdMsg.message_id;
         s.approvalTimer = setTimeout(async () => {
           const fresh = getSessionByRef(ref);
@@ -516,9 +500,7 @@ bot.on('callback_query', async (ctx, next) => {
       if (ttlExpired(s)) return ctx.answerCbQuery('This job has expired.');
 
       if (data.startsWith('drv_accept:')) {
-        if (s.assigned_driver_id) {
-          return ctx.answerCbQuery(s.assigned_driver_id === ctx.from.id ? 'You already have this job.' : 'Already assigned.');
-        }
+        if (s.assigned_driver_id) return ctx.answerCbQuery(s.assigned_driver_id === ctx.from.id ? 'You already have this job.' : 'Already assigned.');
         s.assigned_driver_id = ctx.from.id;
         s.status = 'ASSIGNED';
         s.giveupUntil = now() + 2 * 60 * 1000;
@@ -544,9 +526,7 @@ bot.on('callback_query', async (ctx, next) => {
         await ctx.answerCbQuery('Assigned to you.');
 
         const d = drivers.get(ctx.from.id);
-        if (STAFF_GROUP_ID) {
-          await bot.telegram.sendMessage(STAFF_GROUP_ID, `🚗 Driver accepted\nRef: ${s.ref}\nDriver: ${d ? `${d.name} (${d.phone}) [${d.id}]` : `id ${ctx.from.id}`}`);
-        }
+        if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, `🚗 Driver accepted\nRef: ${s.ref}\nDriver: ${d ? `${d.name} (${d.phone}) [${d.id}]` : `id ${ctx.from.id}`}`);
         await bot.telegram.sendMessage(refs.get(s.ref), `🚚 Your order is on the way.\nDriver: ${d ? d.name : 'Assigned driver'}\nPhone: ${d ? d.phone : '—'}`);
         logMilestone('approved', s, { approver_id: 'auto_after_hold' }).catch(()=>{});
         return;
@@ -566,9 +546,7 @@ bot.on('callback_query', async (ctx, next) => {
       if (data.startsWith('drv_giveup:')) {
         if (!s.giveupUntil || now() > s.giveupUntil) return ctx.answerCbQuery('Give up window has expired.');
         const quitterId = s.assigned_driver_id;
-        s.assigned_driver_id = null;
-        s.status = 'DISPATCHING';
-        s.giveupUntil = null;
+        s.assigned_driver_id = null; s.status = 'DISPATCHING'; s.giveupUntil = null;
         if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Driver canceled — Ref: ${s.ref}. Re-broadcasting to others (excluding ${quitterId}).`);
         await ctx.answerCbQuery('You’ve given up this job.');
         await broadcastToDrivers(s, quitterId);
@@ -693,18 +671,11 @@ async function broadcastToDrivers(s, excludeId = null) {
   const sent = [];
   for (const d of drivers.values()) {
     if (excludeId && d.id === excludeId) continue;
-    try {
-      await bot.telegram.sendMessage(d.id, card, kb(s.ref));
-      sent.push(`${d.name} [${d.id}]`);
-    } catch {
-      failed.push(`${d.name || 'Driver'} [${d.id}]`);
-    }
+    try { await bot.telegram.sendMessage(d.id, card, kb(s.ref)); sent.push(`${d.name} [${d.id}]`); }
+    catch { failed.push(`${d.name || 'Driver'} [${d.id}]`); }
   }
   if (STAFF_GROUP_ID) {
-    await bot.telegram.sendMessage(
-      STAFF_GROUP_ID,
-      `Driver broadcast sent.\nRef: ${s.ref}\n✅ Sent: ${sent.length ? sent.join(', ') : 'none'}\n⚠️ Failed (DM first): ${failed.length ? failed.join(', ') : 'none'}`
-    );
+    await bot.telegram.sendMessage(STAFF_GROUP_ID, `Driver broadcast sent.\nRef: ${s.ref}\n✅ Sent: ${sent.length ? sent.join(', ') : 'none'}\n⚠️ Failed (DM first): ${failed.length ? failed.join(', ') : 'none'}`);
     if (failed.length) await bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Could not DM ${failed.length} driver(s). They must DM the bot at least once.`);
   }
 }
