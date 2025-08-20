@@ -1,5 +1,7 @@
-// parser.js — EMMA order parsing & intent detection
-// Keep all “what counts as an order” logic here so index.js can stay stable.
+// parser.js — EMMA order parsing & intent detection (FINAL)
+// - Robust address & map extraction
+// - Sum quantities across items
+// - Keeps all "what counts as an order" logic out of index.js
 
 'use strict';
 
@@ -9,7 +11,10 @@ const ORDER_HEADER  = /(?:^|\n)\s*🧾\s*Order\s*ID\s*:\s*GG-/i;       // "🧾 
 const HAS_TOTAL     = /\bTotal\s*:\s*ETB\s*[0-9][0-9,.]*/i;
 const HAS_ETB       = /\bETB\b/i;
 const HAS_QTY       = /\b(Qty|Quantity)\b|\bx\s*\d+/i;
-const MAP_URL_RX    = /https?:\/\/(?:maps\.google|goo\.gl)\/[^\s)]+/i;
+
+// BROAD maps regex: handles google.com/maps, maps.app.goo.gl, goo.gl/maps, g.co/maps, and /maps/search
+const MAP_URL_RX    = /https?:\/\/(?:[a-z0-9.-]*google\.com\/maps|maps\.app\.goo\.gl|goo\.gl\/maps|g\.co\/maps)[^\s)]+/i;
+
 const PHONE_RX_251  = /\+?251[-\s.]?\d{9}\b/;
 const PHONE_RX_09   = /\b0?9\d{8}\b/;
 
@@ -69,13 +74,21 @@ function parseOrderFields(text = '') {
   // Reference
   const ref = first(t.match(REF_PATTERN)) || '';
 
-  // Quantity
-  let qty =
-    first(t.match(/\bqty[:\s]*([0-9]+)\b/i)) ||
-    first(t.match(/\bquantity[:\s]*([0-9]+)\b/i)) ||
-    first(t.match(/\bx\s*([0-9]+)\b/i)) ||
-    first(t.match(/\bitems?[:\s]*([0-9]+)\b/i)) ||
-    '—';
+  // Quantity (sum across lines: matches "Qty: N" and "x N")
+  let qty = 0;
+  const qtyMatches = t.match(/(?:Qty\s*:\s*|x\s*)(\d+)/gi);
+  if (qtyMatches) {
+    for (const hit of qtyMatches) {
+      const n = Number((hit.match(/\d+/) || [0])[0]);
+      if (Number.isFinite(n)) qty += n;
+    }
+  }
+  // fallback if nothing summed (e.g., "Items: 5")
+  if (!qty) {
+    const single = first(t.match(/\bitems?[:\s]*([0-9]+)\b/i));
+    qty = single ? Number(single) : 0;
+  }
+  qty = qty || '—';
 
   // Total ETB
   // Matches: "Total: ETB 7,600" or "... = ETB 7600" or "ETB 7600 total"
@@ -84,7 +97,7 @@ function parseOrderFields(text = '') {
     first(t.match(/=\s*ETB\s*([0-9][0-9,.]*)/i)) ||
     first(t.match(/\bETB\s*([0-9][0-9,.]*)\s*total\b/i)) ||
     '—';
-  if (total !== '—') total = total.replace(/[,]/g, '');
+  if (total !== '—') total = total.replace(/,/g, '');
 
   // Delivery fee (many ways users phrase it)
   let delivery =
@@ -92,14 +105,20 @@ function parseOrderFields(text = '') {
     first(t.match(/\bETB\s*([0-9][0-9,.]*)\s*(?:delivery|delivery\s*fee)\b/i)) ||
     first(t.match(/\bጭነት[^0-9]*([0-9][0-9,.]*)\s*ETB\b/)) ||
     '—';
-  if (delivery !== '—') delivery = delivery.replace(/[,]/g, '');
+  if (delivery !== '—') delivery = delivery.replace(/,/g, '');
 
   // Area / Address (take only the rest of the line)
   let area =
-    first(t.match(/(?:Address|Area|አካባቢ|ቦታ)\s*:\s*(.+)/i)) ||
+    first(t.match(/(?:📍\s*)?(?:Address|Area|አካባቢ|ቦታ)\s*:\s*(.+)/i)) ||
     first(t.match(/(?:Pickup|ማንሳት)\s*:\s*(.+)/i)) ||
     '—';
   if (area !== '—') area = area.split('\n')[0].trim();
+
+  // Fallback: any line starting with 📍 then text
+  if (area === '—') {
+    const m = t.match(/📍\s*([^\n]{2,120})/);
+    if (m && m[1]) area = m[1].trim();
+  }
 
   // Map URL
   let map = first(t.match(MAP_URL_RX)) || '—';
