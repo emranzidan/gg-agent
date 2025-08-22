@@ -1,167 +1,126 @@
-// parser.js — EMMA order parsing & intent detection (FINAL)
-// - Robust address & map extraction
-// - Sum quantities across items
-// - Keeps all "what counts as an order" logic out of index.js
+// parser.js — robust order detection & field extraction
+// Handles both google.com/maps place_id and lat,lng URLs.
+// Extracts {total, delivery, qty, area, map, customerName, phone, ref}.
 
-'use strict';
+const STRICT_DEFAULTS = {
+  strictMode: true,
+  minTextLength: 50,
+};
 
-// ---------- Regex anchors (exported for debugging/tests) ----------
-const REF_PATTERN   = /\bGG-\d{8}-\d{6}-[A-Z0-9]{4}\b/;              // GG-YYYYMMDD-HHMMSS-XXXX
-const ORDER_HEADER  = /(?:^|\n)\s*🧾\s*Order\s*ID\s*:\s*GG-/i;       // "🧾 Order ID: GG-..."
-const HAS_TOTAL     = /\bTotal\s*:\s*ETB\s*[0-9][0-9,.]*/i;
-const HAS_ETB       = /\bETB\b/i;
-const HAS_QTY       = /\b(Qty|Quantity)\b|\bx\s*\d+/i;
-
-// BROAD maps regex: handles google.com/maps, maps.app.goo.gl, goo.gl/maps, g.co/maps, and /maps/search
-const MAP_URL_RX    = /https?:\/\/(?:[a-z0-9.-]*google\.com\/maps|maps\.app\.goo\.gl|goo\.gl\/maps|g\.co\/maps)[^\s)]+/i;
-
-const PHONE_RX_251  = /\+?251[-\s.]?\d{9}\b/;
-const PHONE_RX_09   = /\b0?9\d{8}\b/;
-
-// ---------- Helpers ----------
-const clean = (s = '') => s.replace(/\s+/g, ' ').trim();
-const first = (arr, idx = 1) => (arr && arr[idx]) || '';
-
-function normPhone(p) {
-  if (!p) return '';
-  let x = p.replace(/[^\d+]/g, '');
-  if (x.startsWith('0')) x = '+251' + x.slice(1);
-  if (!x.startsWith('+')) x = '+' + x;
-  return x;
-}
-
-// ---------- Public: question detector (for support escalation) ----------
-function isLikelyQuestion(text = '') {
+// -------------------- basic heuristics --------------------
+function isLikelyQuestion(text) {
   if (!text) return false;
-  if (/[?؟]/.test(text)) return true;
-  if (/\b(help|support|problem|issue|እርዳታ|ረዳ|ጥያቄ)\b/i.test(text)) return true;
-  return false;
+  const s = text.toLowerCase();
+  if (s.includes('?')) return true;
+  const triggers = ['how', 'where', 'why', 'help', 'support', 'problem', 'issue', 'can you', 'please call'];
+  return triggers.some(w => s.includes(w));
 }
 
-// ---------- Public: strict order detector ----------
-/**
- * Determine if a DM text looks like a real order summary.
- * @param {string} text - raw incoming message
- * @param {object} opts - { strictMode=true, minTextLength=50 }
- */
-function isOrderSummaryStrict(text = '', opts = {}) {
-  const strictMode    = opts.strictMode !== false; // default true
-  const minLen        = Number.isFinite(opts.minTextLength) ? opts.minTextLength : 50;
-
-  const t = text;
-  if (!t || t.length < minLen) return false;
-
-  // Primary rule: proper header + ref + any money signal
-  const byHeader  = ORDER_HEADER.test(t) && REF_PATTERN.test(t) && (HAS_TOTAL.test(t) || HAS_ETB.test(t));
-
-  // Secondary rule: ref + ETB + any quantity signal
-  const bySignals = REF_PATTERN.test(t) && HAS_ETB.test(t) && HAS_QTY.test(t);
-
-  // In non-strict mode, allow “ref + ETB” if the message is long enough
-  const relaxed   = !strictMode && REF_PATTERN.test(t) && HAS_ETB.test(t);
-
-  return byHeader || bySignals || relaxed;
+function extractRef(text) {
+  if (!text) return '';
+  const m = text.match(/GG-\d{8}-\d{6}-[A-Z0-9]{4}/i);
+  return m ? m[0] : '';
 }
 
-// ---------- Public: extract useful fields for ops/driver cards ----------
-/**
- * Parse fields from an order summary.
- * Returns: { ref, qty, total, delivery, area, map, phone, customerName }
- */
-function parseOrderFields(text = '') {
-  const t = text;
+function isOrderSummaryStrict(text, opts = {}) {
+  const cfg = { ...STRICT_DEFAULTS, ...opts };
+  if (!text) return false;
+  const s = text.trim();
+  if (s.length < cfg.minTextLength) return false;
 
-  // Reference
-  const ref = first(t.match(REF_PATTERN)) || '';
+  // Must contain our ref and at least one of the expected anchors
+  const hasRef = /GG-\d{8}-\d{6}-[A-Z0-9]{4}/.test(s);
+  const hasOrderBlock = /Order Details/i.test(s) || /🧾\s*Order ID:/i.test(s);
+  const hasTotal = /Total:\s*ETB/i.test(s);
 
-  // Quantity (sum across lines: matches "Qty: N" and "x N")
-  let qty = 0;
-  const qtyMatches = t.match(/(?:Qty\s*:\s*|x\s*)(\d+)/gi);
-  if (qtyMatches) {
-    for (const hit of qtyMatches) {
-      const n = Number((hit.match(/\d+/) || [0])[0]);
-      if (Number.isFinite(n)) qty += n;
-    }
+  if (cfg.strictMode) {
+    return hasRef && hasOrderBlock && hasTotal;
   }
-  // fallback if nothing summed (e.g., "Items: 5")
-  if (!qty) {
-    const single = first(t.match(/\bitems?[:\s]*([0-9]+)\b/i));
-    qty = single ? Number(single) : 0;
-  }
-  qty = qty || '—';
+  return hasRef || hasOrderBlock || hasTotal;
+}
 
-  // Total ETB
-  // Matches: "Total: ETB 7,600" or "... = ETB 7600" or "ETB 7600 total"
-  let total =
-    first(t.match(/\bTotal\s*:\s*ETB\s*([0-9][0-9,.]*)/i)) ||
-    first(t.match(/=\s*ETB\s*([0-9][0-9,.]*)/i)) ||
-    first(t.match(/\bETB\s*([0-9][0-9,.]*)\s*total\b/i)) ||
-    '—';
-  if (total !== '—') total = total.replace(/,/g, '');
+// -------------------- field extraction --------------------
+function extractMapUrl(text) {
+  if (!text) return '';
+  // capture any google maps / goo.gl maps URL
+  const re = /(https?:\/\/(?:www\.)?(?:google\.com\/maps[^\s\)]*|goo\.gl\/maps\/[^\s\)]*))/i;
+  const m = text.match(re);
+  if (!m) return '';
+  // trim trailing punctuation
+  return m[1].replace(/[)\]\}\.,]+$/, '');
+}
 
-  // Delivery fee (many ways users phrase it)
-  let delivery =
-    first(t.match(/\bDelivery(?:\s*Fee)?\s*:\s*ETB\s*([0-9][0-9,.]*)/i)) ||
-    first(t.match(/\bETB\s*([0-9][0-9,.]*)\s*(?:delivery|delivery\s*fee)\b/i)) ||
-    first(t.match(/\bጭነት[^0-9]*([0-9][0-9,.]*)\s*ETB\b/)) ||
-    '—';
-  if (delivery !== '—') delivery = delivery.replace(/,/g, '');
+function extractArea(text) {
+  if (!text) return '';
+  // Look for the Address line
+  const addrLine = (text.split('\n').find(l => /📍\s*Address:/i.test(l)) || '')
+    .replace(/📍\s*Address:\s*/i, '')
+    .trim();
 
-  // Area / Address (take only the rest of the line)
-  let area =
-    first(t.match(/(?:📍\s*)?(?:Address|Area|አካባቢ|ቦታ)\s*:\s*(.+)/i)) ||
-    first(t.match(/(?:Pickup|ማንሳት)\s*:\s*(.+)/i)) ||
-    '—';
-  if (area !== '—') area = area.split('\n')[0].trim();
+  if (!addrLine) return '';
 
-  // Fallback: any line starting with 📍 then text
-  if (area === '—') {
-    const m = t.match(/📍\s*([^\n]{2,120})/);
-    if (m && m[1]) area = m[1].trim();
-  }
+  // Take text before the first comma to keep it short (keeps "Wesen Michael | ወሰን ሚካኤል")
+  const beforeComma = addrLine.split(',')[0].trim();
+  if (beforeComma) return beforeComma;
 
-  // Map URL
-  let map = first(t.match(MAP_URL_RX)) || '—';
+  // fallback: return full line (but trimmed)
+  return addrLine;
+}
 
-  // Phone (normalize to +2519xxxxxxxx if starts with 09)
-  let phone = first(t.match(PHONE_RX_251)) || first(t.match(PHONE_RX_09)) || '';
-  phone = normPhone(phone);
+function extractTotal(text) {
+  if (!text) return '';
+  const m = text.match(/Total:\s*ETB\s*([\d,\.]+)/i);
+  return m ? Number(m[1].replace(/[^\d]/g, '')) : '';
+}
 
-  // Customer name (best-effort)
-  let customerName =
-    clean(first(t.match(/(?:^|\n)\s*👤\s*([^@\n]{2,64})/))) || // after 👤
-    clean(first(t.match(/(?:^|\n)\s*Name\s*:\s*([^\n]{2,64})/i))) ||
-    '';
+function extractDeliveryFee(text) {
+  if (!text) return '';
+  const m = text.match(/Delivery Fee:\s*ETB\s*([\d,\.]+)/i);
+  return m ? Number(m[1].replace(/[^\d]/g, '')) : '';
+}
 
+function extractQty(text) {
+  if (!text) return '';
+  // Sum all "🔢 Qty: N" lines
+  const matches = text.match(/🔢\s*Qty:\s*(\d+)/gi) || [];
+  const sum = matches.reduce((acc, line) => {
+    const n = Number((line.match(/(\d+)/) || [0])[0]);
+    return acc + (Number.isFinite(n) ? n : 0);
+  }, 0);
+  return sum || '';
+}
+
+function extractCustomerName(text) {
+  if (!text) return '';
+  // After "👤"
+  const line = (text.split('\n').find(l => /^👤/.test(l)) || '').replace(/^👤\s*/, '').trim();
+  return line || '';
+}
+
+function extractPhone(text) {
+  if (!text) return '';
+  const line = (text.split('\n').find(l => /^📞/.test(l)) || '').replace(/^📞\s*/, '').trim();
+  return line || '';
+}
+
+function parseOrderFields(text) {
+  if (!text) return {};
   return {
-    ref: ref || '',
-    qty: qty || '—',
-    total: total || '—',
-    delivery: delivery || '—',
-    area: area || '—',
-    map: map || '—',
-    phone,
-    customerName
+    ref: extractRef(text),
+    total: extractTotal(text),
+    delivery: extractDeliveryFee(text),
+    qty: extractQty(text),
+    area: extractArea(text) || '—',
+    map: extractMapUrl(text) || '—',
+    customerName: extractCustomerName(text) || '',
+    phone: extractPhone(text) || '',
   };
 }
 
-// ---------- Public: tiny helpers the bot may want ----------
-function extractRef(text = '') {
-  return first(text.match(REF_PATTERN)) || '';
-}
-
+// -------------------- exports --------------------
 module.exports = {
-  // regex for tests
-  REF_PATTERN,
-  ORDER_HEADER,
-  HAS_TOTAL,
-  HAS_ETB,
-  HAS_QTY,
-  MAP_URL_RX,
-
-  // core API
   isLikelyQuestion,
   isOrderSummaryStrict,
   parseOrderFields,
-  extractRef
+  extractRef,
 };
