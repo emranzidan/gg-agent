@@ -794,7 +794,10 @@ bot.on('message', async (ctx) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Driver broadcast
+// PATCH START: add customer name to driver broadcast
+// Find function: broadcastToDrivers(s)
+// After building `card` with t('driver.broadcast_card_am'...), inject customerName.
+
 async function broadcastToDrivers(s, excludeId = null) {
   if (drivers.size === 0) {
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, '⚠️ No drivers configured. Use /adddriver in owner DM.');
@@ -806,9 +809,14 @@ async function broadcastToDrivers(s, excludeId = null) {
 
   const f = parseOrderFields(s.summary);
   const mapLine = f.map && f.map !== '—' ? t('driver.broadcast_map_line_am', { MAP_URL: f.map }) : '';
-  const card = t('driver.broadcast_card_am', {
+  let card = t('driver.broadcast_card_am', {
     REF: s.ref, QTY: f.qty, AREA: f.area, TOTAL: f.total, DELIVERY_FEE: f.delivery, MAP_LINE: mapLine
   });
+
+  // ADD: prepend customer name if available
+  if (f.customerName) {
+    card = `👤 ${f.customerName}\n` + card;
+  }
 
   const failed = [];
   const sent = [];
@@ -829,6 +837,7 @@ async function broadcastToDrivers(s, excludeId = null) {
     if (failed.length) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.broadcast_failed_hint', { COUNT: failed.length }));
   }
 }
+// PATCH END
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Launch
