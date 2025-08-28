@@ -22,22 +22,35 @@ function extractRef(text) {
   return m ? m[0] : '';
 }
 
+// PATCH START: relax strict acceptance (Order ID + any of {Address, Qty, Size})
 function isOrderSummaryStrict(text, opts = {}) {
   const cfg = { ...STRICT_DEFAULTS, ...opts };
   if (!text) return false;
   const s = text.trim();
   if (s.length < cfg.minTextLength) return false;
 
-  // Must contain our ref and at least one of the expected anchors
   const hasRef = /GG-\d{8}-\d{6}-[A-Z0-9]{4}/.test(s);
+
+  // Existing anchors (kept)
   const hasOrderBlock = /Order Details/i.test(s) || /🧾\s*Order ID:/i.test(s);
   const hasTotal = /Total:\s*ETB/i.test(s);
 
+  // New tolerant anchors
+  const hasAddress = /📍\s*Address:/i.test(s) || /\bAddress:\s*/i.test(s);
+  const hasQty = /🔢\s*Qty:\s*\d+/i.test(s) || /\bQty:\s*\d+/i.test(s);
+  const hasSize = /⚖️\s*Size:\s*[\d.,]+\s*g/i.test(s) || /\bSize:\s*[\d.,]+\s*g/i.test(s);
+
   if (cfg.strictMode) {
-    return hasRef && hasOrderBlock && hasTotal;
+    // Minimal acceptance: valid Order ID AND at least one core field
+    const minimalOk = hasRef && (hasAddress || hasQty || hasSize);
+    // Backward-compatible acceptance (old templates)
+    const legacyOk = hasRef && hasOrderBlock && hasTotal;
+    return minimalOk || legacyOk;
   }
-  return hasRef || hasOrderBlock || hasTotal;
+  // Non-strict fallback unchanged
+  return hasRef || hasOrderBlock || hasTotal || hasAddress || hasQty || hasSize;
 }
+// PATCH END
 
 // -------------------- field extraction --------------------
 function extractMapUrl(text) {
@@ -97,11 +110,30 @@ function extractCustomerName(text) {
   return line || '';
 }
 
+// PATCH START: broaden phone capture but keep user's original format
 function extractPhone(text) {
   if (!text) return '';
-  const line = (text.split('\n').find(l => /^📞/.test(l)) || '').replace(/^📞\s*/, '').trim();
-  return line || '';
+
+  const lines = text.split('\n').map(l => l.trim());
+
+  // 1) Prefer 📞 line exactly as user typed it (no reformatting)
+  const phoneEmojiLine = lines.find(l => /^📞/i.test(l));
+  if (phoneEmojiLine) {
+    return phoneEmojiLine.replace(/^📞\s*/i, '').trim();
+  }
+
+  // 2) Fallback: a line containing "phone"
+  const phoneWordLine = lines.find(l => /\bphone\b/i.test(l));
+  if (phoneWordLine) {
+    return phoneWordLine.replace(/^\s*phone\s*[:\-]?\s*/i, '').trim();
+  }
+
+  // 3) Last resort: find a plausible phone token anywhere (keep original token)
+  // captures +251xxxxxxxxx, 251xxxxxxxxx, 09xxxxxxxxx, or 9xxxxxxxxx (9–12 digits)
+  const m = text.match(/(\+?251\d{9}|251\d{9}|0?9\d{8,9}|\b9\d{8,9}\b)/);
+  return m ? m[1] : '';
 }
+// PATCH END
 
 function parseOrderFields(text) {
   if (!text) return {};
