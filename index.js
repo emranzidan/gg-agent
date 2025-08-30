@@ -1,28 +1,21 @@
-// index.js — GreenGold EMMA (God Mode, modular, DB-wired)
-// Reads behavior/text from: features.json, messages.json, drivers.json, and parser.js.
-// Customer DM flow lives in: flows/customerBotFlow.js
-// DB recording lives in: data/recorder.js
-
+// index.js — GreenGold EMMA (God Mode, modular, Sheets-ready)
+// Stable entrypoint. Conversations are handled in ./flows/customerBotFlow.js
+// State & refs live in ./core/session.js. Parsing in ./parser.js
 'use strict';
 
+// ─────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const fs   = require('fs');
 const path = require('path');
 
-// Order detection / parsing
+// Order detection / parsing brain
 const {
   isLikelyQuestion,
   isOrderSummaryStrict,
   parseOrderFields,
   extractRef
 } = require('./parser');
-
-// Session store (centralized)
-const Session = require('./core/session');
-
-// DB recorder (Render Postgres)
-const recorder = require('./data/recorder');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Paths
@@ -51,10 +44,28 @@ function loadFeatures() {
   // defaults
   FEATURES = {
     time: { timezone: 'Africa/Addis_Ababa', cutoffHourLocal: 18, ...(f.time || {}) },
-    flows: { holdSeconds: 60, buttonTtlSeconds: 900, driverWindowMinutes: 30, driverGiveUpMinutes: 2, allowNewOrderWhileActive: true, deepLinkTtlMs: 30*60*1000, ...(f.flows || {}) },
+    flows: {
+      holdSeconds: 60,
+      buttonTtlSeconds: 900,
+      driverWindowMinutes: 30,
+      driverGiveUpMinutes: 2,
+      allowNewOrderWhileActive: true,
+      deepLinkTtlMs: 30*60*1000,
+      sessionTtlMinutes: 90,
+      tinEnabled: true,
+      ...(f.flows || {})
+    },
     intake: { strictMode: true, escalateOnQuestion: true, minTextLength: 50, ...(f.intake || {}) },
     support: { enabled: true, phone: '+251 2601986', ...(f.support || {}) },
-    flags: { flagDuplicateReceipts: true, flagForwardedReceipts: true, reReviewOnUndo: true, opsUnassignEnabled: false, sheetsExportEnabled: false, notifySupersede: true, ...(f.flags || {}) },
+    flags: {
+      flagDuplicateReceipts: true,
+      flagForwardedReceipts: true,
+      reReviewOnUndo: true,
+      opsUnassignEnabled: false,
+      sheetsExportEnabled: false,
+      notifySupersede: true,
+      ...(f.flags || {})
+    },
     ops: { approveScope: 'members', rateLimitMs: 1500, ...(f.ops || {}) },
     broadcast: { language: 'am', shortCard: true, ...(f.broadcast || {}) },
     _meta: f._meta || { version: '1.0' }
@@ -80,10 +91,7 @@ function loadDriversFromFile() {
   console.log(`Drivers loaded: ${drivers.size}`);
 }
 function exportDriversJson() {
-  return JSON.stringify(
-    [...drivers.values()].map(d => ({ id: d.id, name: d.name, phone: d.phone })),
-    null, 2
-  );
+  return JSON.stringify([...drivers.values()].map(d => ({ id: d.id, name: d.name, phone: d.phone })), null, 2);
 }
 
 // Initial load
@@ -108,9 +116,9 @@ let SUPPORT_GROUP_ID = process.env.SUPPORT_GROUP_ID ? Number(process.env.SUPPORT
 const SHEETS_URL    = process.env.SHEETS_WEBHOOK_URL || '';
 const SHEETS_SECRET = process.env.SHEETS_SECRET || '';
 
-// Derived runtime knobs (made let so /reload_texts can refresh)
+// Derived runtime knobs
 let APPROVE_SCOPE, RATE_LIMIT_MS, HOLD_SECONDS, BUTTON_TTL_SEC, DRIVER_WINDOW_MS, GIVEUP_MS, ALLOW_NEW_ORDER;
-let SUPPORT_ENABLED, SUPPORT_PHONE, DUP_FLAG, FWD_FLAG, RE_REVIEW_ON_UNDO, OPS_UNASSIGN_EN, TIMEZONE, CUTOFF_HOUR;
+let SUPPORT_ENABLED, SUPPORT_PHONE, DUP_FLAG, FWD_FLAG, RE_REVIEW_ON_UNDO, OPS_UNASSIGN_EN, TIMEZONE, CUTOFF_HOUR, NOTIFY_SUPERSEDE;
 
 function refreshDerived() {
   APPROVE_SCOPE     = String(process.env.APPROVE_SCOPE || FEATURES.ops.approveScope || 'members').toLowerCase();
@@ -128,6 +136,7 @@ function refreshDerived() {
   FWD_FLAG          = !!FEATURES.flags.flagForwardedReceipts;
   RE_REVIEW_ON_UNDO = !!FEATURES.flags.reReviewOnUndo;
   OPS_UNASSIGN_EN   = !!FEATURES.flags.opsUnassignEnabled;
+  NOTIFY_SUPERSEDE  = !!FEATURES.flags.notifySupersede;
 
   TIMEZONE          = String(FEATURES.time.timezone || 'Africa/Addis_Ababa');
   CUTOFF_HOUR       = Number(FEATURES.time.cutoffHourLocal || 18);
@@ -135,28 +144,29 @@ function refreshDerived() {
 refreshDerived();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Bot state (non-session)
+// Session module
+let Session = null;
+try {
+  Session = require('./core/session');
+  console.log('core/session loaded.');
+} catch (e) {
+  console.error('Missing ./core/session.js — please add it.');
+  process.exit(1);
+}
+
 const bot = new Telegraf(BOT_TOKEN);
-let maintenance = { on: false, note: '' };
-const userRate = new Map();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilities
 const isPrivate = (ctx) => ctx.chat?.type === 'private';
 const isGroup   = (ctx) => ['group', 'supergroup'].includes(ctx.chat?.type);
 const isOwner   = (ctx) => OWNER_IDS.includes(ctx.from?.id);
-const now       = () => Date.now();
+function now() { return Date.now(); }
 function localHour(tz) {
   try { return Number(new Intl.DateTimeFormat('en-GB', { hour: '2-digit', hour12: false, timeZone: tz }).format(new Date())); }
-  catch { return (new Date().getUTCHours() + 3) % 24; } // fallback Addis offset
+  catch { return (new Date().getUTCHours() + 3) % 24; }
 }
 function afterCutoff() { return localHour(TIMEZONE) >= CUTOFF_HOUR; }
-function rateLimited(uid, minMs = RATE_LIMIT_MS) {
-  const last = userRate.get(uid) || 0;
-  const ok = now() - last >= minMs;
-  if (ok) userRate.set(uid, now());
-  return !ok;
-}
 async function isGroupAdmin(ctx) {
   try {
     if (!isGroup(ctx)) return false;
@@ -176,7 +186,7 @@ function get(obj, pathStr) {
 }
 function t(key, vars = {}) {
   let s = get(MSG, key);
-  if (!s || typeof s !== 'string') return key; // fallback to key string if missing
+  if (!s || typeof s !== 'string') return key;
   return s.replace(/\{([A-Z0-9_]+)\}/g, (_, k) => (k in vars ? String(vars[k]) : `{${k}}`));
 }
 
@@ -191,8 +201,9 @@ function setDriverTimer(ref) {
         STAFF_GROUP_ID,
         t('staff.no_driver_ping', { MINUTES: Math.round(DRIVER_WINDOW_MS / 60000), REF: ref })
       );
-      const uid = still._customerId;
-      if (uid) await bot.telegram.sendMessage(uid, t('customer.no_driver_delay', { REF: ref })).catch(()=>{});
+      if (s._customerId) {
+        await bot.telegram.sendMessage(s._customerId, t('customer.no_driver_delay', { REF: ref })).catch(()=>{});
+      }
     }
   }, DRIVER_WINDOW_MS);
 }
@@ -217,6 +228,14 @@ async function postSheets(event, data = {}) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Health & basics
 bot.start(async (ctx) => {
+  const txt = ctx.message?.text || '';
+  const payload = txt.split(' ')[1];
+
+  if (payload && payload.startsWith('GG_')) {
+    await ctx.reply('Link received. Please paste your order summary here to continue.');
+    return;
+  }
+
   await ctx.reply('EMMA online. Use /ping here. In your staff group, run /setstaff once.');
 });
 bot.command('ping', async (ctx) => ctx.reply(`pong | ${new Date().toISOString()}`));
@@ -232,29 +251,49 @@ bot.command('setstaff', async (ctx) => {
 });
 
 // Maintenance
+let maintenance = { on: false, note: '' };
 bot.command('maintenance', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   const args = ctx.message.text.split(' ').slice(1);
   const mode = (args.shift() || '').toLowerCase();
-  if (mode === 'on') { maintenance.on = true; maintenance.note = args.join(' ') || ''; return ctx.reply(`✅ Maintenance ON\nNote: ${maintenance.note}`); }
-  if (mode === 'off') { maintenance.on = false; maintenance.note = ''; return ctx.reply('✅ Maintenance OFF'); }
+  if (mode === 'on')  { maintenance.on = true;  maintenance.note = args.join(' ') || ''; return ctx.reply(`✅ Maintenance ON\nNote: ${maintenance.note}`); }
+  if (mode === 'off') { maintenance.on = false; maintenance.note = '';            return ctx.reply('✅ Maintenance OFF'); }
   return ctx.reply('Usage:\n/maintenance on <note>\n/maintenance off');
 });
 
-// Payment text manage via messages.json (owner only helpers)
+// Payment text manage via messages.json (in-memory change; persist by editing file)
 const waitFor = new Map(); // chat_id -> 'telebirr'|'bank'
-bot.command('settelebirr', async (ctx) => { if (!isOwner(ctx) || !isPrivate(ctx)) return; waitFor.set(ctx.chat.id, 'telebirr'); ctx.reply('Send the new Telebirr text as your next message. (To persist, edit messages.json)'); });
-bot.command('setbank',     async (ctx) => { if (!isOwner(ctx) || !isPrivate(ctx)) return; waitFor.set(ctx.chat.id, 'bank');     ctx.reply('Send the new Bank text as your next message. (To persist, edit messages.json)'); });
-bot.command('getpay',      async (ctx) => { if (!isOwner(ctx) || !isPrivate(ctx)) return; ctx.reply(`Telebirr:\n${get(MSG,'customer.payment_info_telebirr')}\n\nBank:\n${get(MSG,'customer.payment_info_cbe')}`); });
+bot.command('settelebirr', async (ctx) => {
+  if (!isOwner(ctx) || !isPrivate(ctx)) return;
+  waitFor.set(ctx.chat.id, 'telebirr');
+  ctx.reply('Send the new Telebirr text as your next message. (To persist, edit messages.json)');
+});
+bot.command('setbank', async (ctx) => {
+  if (!isOwner(ctx) || !isPrivate(ctx)) return;
+  waitFor.set(ctx.chat.id, 'bank');
+  ctx.reply('Send the new Bank text as your next message. (To persist, edit messages.json)');
+});
+bot.command('getpay', async (ctx) => {
+  if (!isOwner(ctx) || !isPrivate(ctx)) return;
+  ctx.reply(`Telebirr:\n${get(MSG,'customer.payment_info_telebirr')}\n\nBank:\n${get(MSG,'customer.payment_info_cbe')}`);
+});
 bot.on('text', async (ctx, next) => {
   const pending = waitFor.get(ctx.chat.id);
   if (pending && isPrivate(ctx) && isOwner(ctx)) {
-    if (pending === 'telebirr') { MSG.customer.payment_info_telebirr = ctx.message.text.trim(); await ctx.reply('✅ Telebirr text updated (in-memory). Edit messages.json to persist.'); }
-    if (pending === 'bank')     { MSG.customer.payment_info_cbe      = ctx.message.text.trim(); await ctx.reply('✅ Bank text updated (in-memory). Edit messages.json to persist.'); }
+    if (pending === 'telebirr') {
+      MSG.customer = MSG.customer || {};
+      MSG.customer.payment_info_telebirr = ctx.message.text.trim();
+      await ctx.reply('✅ Telebirr text updated (in-memory). Edit messages.json to persist.');
+    }
+    if (pending === 'bank') {
+      MSG.customer = MSG.customer || {};
+      MSG.customer.payment_info_cbe = ctx.message.text.trim();
+      await ctx.reply('✅ Bank text updated (in-memory). Edit messages.json to persist.');
+    }
     waitFor.delete(ctx.chat.id);
     return;
   }
-  return next();
+  if (typeof next === 'function') return next();
 });
 
 // Drivers CRUD (+ persistence helpers)
@@ -292,7 +331,7 @@ bot.command('drivers_export', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   const json = exportDriversJson();
   if (json.length > 3500) {
-    const chunks = json.match(/[\s\S]{1,3500}/g) || [json];
+    const chunks = json.match(/[\s/S]{1,3500}/g) || [json];
     await ctx.reply(`Current drivers JSON (${chunks.length} part(s)) — paste into drivers.json:`);
     for (const part of chunks) await ctx.reply(part);
     return;
@@ -300,7 +339,7 @@ bot.command('drivers_export', async (ctx) => {
   return ctx.reply(json);
 });
 
-// Owner: soft reset & force
+// Owner: revert & force-approve
 bot.command('revert', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   const ref = (ctx.message.text.split(' ')[1] || '').trim();
@@ -309,7 +348,7 @@ bot.command('revert', async (ctx) => {
   s.status = 'AWAITING_RECEIPT';
   s.assigned_driver_id = null; s.giveupUntil = null;
   clearDriverTimer(s);
-  s.createdAt = now(); // refresh TTL
+  s.createdAt = Date.now(); // refresh TTL
   return ctx.reply(`↩️ Reverted order ${ref} to AWAITING_RECEIPT.`);
 });
 bot.command('forceapprove', async (ctx) => {
@@ -317,15 +356,14 @@ bot.command('forceapprove', async (ctx) => {
   const ref = (ctx.message.text.split(' ')[1] || '').trim();
   const s = Session.getSessionByRef(ref);
   if (!s) return ctx.reply('Ref not found.');
-  const uid = s._customerId;
   s.status = 'APPROVED_HOLD'; s.approvalTimer = null;
-  await finalizeApproval(s, uid);
+  await finalizeApproval(s);
   return ctx.reply(`✅ Forced approval for ${ref}.`);
 });
 
 // Ops: optional unassign & rebroadcast (guarded by feature flag)
 bot.command('unassign', async (ctx) => {
-  if (!OPS_UNASSIGN_EN) return; // disabled unless feature flag on
+  if (!OPS_UNASSIGN_EN) return;
   if (!isOwner(ctx) || (isGroup(ctx) && ctx.chat.id !== STAFF_GROUP_ID)) return;
   const ref = (ctx.message.text.split(' ')[1] || '').trim();
   const s = Session.getSessionByRef(ref);
@@ -357,19 +395,8 @@ bot.command('reload_texts', async (ctx) => {
   return ctx.reply('🔄 Reloaded messages.json & features.json.');
 });
 
-// Customer helpers
-bot.command('cancel', async (ctx) => {
-  if (!isPrivate(ctx)) return;
-  const s = Session.getSession(ctx.from.id);
-  if (!s) return ctx.reply(get(MSG, 'customer.cancel_done') || 'Canceled.');
-  // clear mapping + session
-  try { if (s.ref) Session.deleteRef(s.ref); } catch {}
-  Session.deleteSession(ctx.from.id);
-  return ctx.reply(get(MSG, 'customer.cancel_done') || 'Canceled.');
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Support escalation claim (support flow orchestration is handled in flows for customers)
+// Callback handlers: support claim, staff approvals, driver actions
 bot.on('callback_query', async (ctx, next) => {
   try {
     const data = String(ctx.callbackQuery.data || '');
@@ -401,24 +428,29 @@ bot.on('callback_query', async (ctx, next) => {
         if (s.approvalTimer) { clearTimeout(s.approvalTimer); s.approvalTimer = null; }
         s.status = 'AWAITING_RECEIPT';
         s.assigned_driver_id = null; s.giveupUntil = null;
-        s.createdAt = now(); // refresh TTL
+        s.createdAt = Date.now(); // refresh TTL
         if (s.holdMsgId) {
           await bot.telegram.editMessageText(STAFF_GROUP_ID, s.holdMsgId, undefined, t('staff.approval_undone_message', { REF: s.ref })).catch(()=>{});
         }
-        const uid = s._customerId;
         const reKb = Markup.inlineKeyboard([
-          [Markup.button.callback(get(MSG,'buttons.approve') || 'Approve', `approve:${uid}:${s.ref}`),
-           Markup.button.callback(get(MSG,'buttons.reject')  || 'Reject',  `reject:${uid}:${s.ref}`)]
+          [Markup.button.callback(get(MSG,'buttons.approve') || 'Approve', `approve:${s._customerId || '0'}:${s.ref}`),
+           Markup.button.callback(get(MSG,'buttons.reject')  || 'Reject',  `reject:${s._customerId || '0'}:${s.ref}`)]
         ]);
         await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.re_review_prompt', { REF: s.ref }), reKb);
         return ctx.answerCbQuery('Approval undone.');
       }
 
       const [verb, userIdStr, ref] = data.split(':');
-      const uidFromBtn = Number(userIdStr);
-      const s = Session.getSessionByRef(ref) || (uidFromBtn ? Session.getSession(uidFromBtn) : null);
+      const uid = Number(userIdStr);
+      const s = Session.getSessionByRef(ref);
       if (!s || s.ref !== ref) return ctx.answerCbQuery('Order not found.');
-      // NOTE: TTL for action buttons is enforced in customer flow at intake time.
+      if (Session.ttlExpired(s)) {
+        await ctx.answerCbQuery('Action expired.');
+        await ctx.telegram.sendMessage(STAFF_GROUP_ID, t('staff.action_expired', { REF: ref }));
+        return;
+      }
+      // remember customer id on session so timers can DM later
+      if (uid && !s._customerId) s._customerId = uid;
 
       if (verb === 'approve') {
         s.status = 'APPROVED_HOLD';
@@ -432,19 +464,18 @@ bot.on('callback_query', async (ctx, next) => {
         s.approvalTimer = setTimeout(async () => {
           const fresh = Session.getSessionByRef(ref);
           if (!fresh || fresh.status !== 'APPROVED_HOLD') return;
-          await finalizeApproval(fresh, fresh._customerId).catch(()=>{});
+          await finalizeApproval(fresh).catch(()=>{});
         }, HOLD_SECONDS * 1000);
+        // DM customer that payment confirmed & dispatching soon (after hold completes)
+        if (s._customerId) {
+          await bot.telegram.sendMessage(s._customerId, t('customer.payment_confirmed_after_hold', { REF: s.ref })).catch(()=>{});
+        }
         return ctx.answerCbQuery('Approved (on hold).');
       } else {
-        // Reject
         s.status = 'REJECTED';
-        if (s._customerId) await ctx.telegram.sendMessage(s._customerId, t('customer.payment_rejected', { REF: s.ref, SUPPORT_PHONE })).catch(()=>{});
+        if (uid) await ctx.telegram.sendMessage(uid, t('customer.payment_rejected', { REF: s.ref, SUPPORT_PHONE })).catch(()=>{});
         await ctx.editMessageCaption({ caption: t('staff.rejected_caption', { REF: s.ref }) }).catch(()=>{});
         await ctx.telegram.sendMessage(STAFF_GROUP_ID, t('staff.rejected_notice', { REF: s.ref }));
-
-        // DB: rejected
-        try { await recorder.recordRejected(s.ref, s.summary || ''); } catch (e) { console.error('recorder.recordRejected error', e.message); }
-
         return ctx.answerCbQuery('Rejected.');
       }
     }
@@ -455,14 +486,19 @@ bot.on('callback_query', async (ctx, next) => {
       const [, ref] = data.split(':');
       const s = Session.getSessionByRef(ref);
       if (!s) return ctx.answerCbQuery('Job not found.');
+      if (Session.ttlExpired(s)) return ctx.answerCbQuery('This job has expired.');
 
       if (data.startsWith('drv_accept:')) {
         if (s.assigned_driver_id) {
-          return ctx.answerCbQuery(s.assigned_driver_id === ctx.from.id ? (get(MSG,'driver.accept_you_already_have') || 'You already have this job.') : (get(MSG,'driver.accept_already_assigned') || 'Already assigned.'));
+          return ctx.answerCbQuery(
+            s.assigned_driver_id === ctx.from.id
+              ? (get(MSG,'driver.accept_you_already_have') || 'You already have this job.')
+              : (get(MSG,'driver.accept_already_assigned') || 'Already assigned.')
+          );
         }
         s.assigned_driver_id = ctx.from.id;
         s.status = 'ASSIGNED';
-        s.giveupUntil = now() + GIVEUP_MS;
+        s.giveupUntil = Date.now() + GIVEUP_MS;
         clearDriverTimer(s);
 
         const btnPicked = get(MSG,'buttons.drv_picked_am') || '✔ ተነሳ';
@@ -476,12 +512,13 @@ bot.on('callback_query', async (ctx, next) => {
 
         const f = parseOrderFields(s.summary || '');
         const mapLine = f.map && f.map !== '—' ? t('driver.broadcast_map_line_am', { MAP_URL: f.map }) : '';
-        await ctx.reply(
-          t('driver.assigned_card_am', {
-            REF: s.ref, QTY: f.qty, AREA: f.area, TOTAL: f.total, DELIVERY_FEE: f.delivery, MAP_LINE: mapLine
-          }) + (f.phone ? `\n${get(MSG,'driver.phone_line') || '📞 {PHONE}'} `.replace('{PHONE}', f.phone) : ''),
-          driverActions
-        );
+        let assignedCard = t('driver.assigned_card_am', {
+          REF: s.ref, QTY: f.qty, AREA: f.area, TOTAL: f.total, DELIVERY_FEE: f.delivery, MAP_LINE: mapLine
+        });
+        // ➕ include customer phone
+        if (f.phone) assignedCard += `\n📞 ${f.phone}`;
+
+        await ctx.reply(assignedCard, driverActions);
         await ctx.answerCbQuery('Assigned to you.');
 
         const d = drivers.get(ctx.from.id);
@@ -490,22 +527,22 @@ bot.on('callback_query', async (ctx, next) => {
             REF: s.ref, DRIVER_NAME: d ? d.name : `id ${ctx.from.id}`, DRIVER_PHONE: d ? d.phone : '—', USER_ID: d ? d.id : ctx.from.id
           }));
         }
-        const uid = s._customerId;
-        if (uid) await bot.telegram.sendMessage(uid, t('customer.driver_assigned', { REF: s.ref, DRIVER_NAME: d ? d.name : 'Assigned driver', DRIVER_PHONE: d ? d.phone : '—' })).catch(()=>{});
+        // DM customer that a driver is assigned
+        if (s._customerId) {
+          await bot.telegram.sendMessage(s._customerId, t('customer.driver_assigned', {
+            REF: s.ref, DRIVER_NAME: d ? d.name : 'Assigned driver', DRIVER_PHONE: d ? d.phone : '—'
+          })).catch(()=>{});
+        }
 
-        // DB: driver assigned (and accepted timestamp)
-        try { await recorder.recordDriverAssigned(s.ref, d || { id: ctx.from.id, name: d?.name || null, phone: d?.phone || null }); } catch (e) { console.error('recorder.recordDriverAssigned error', e.message); }
-
-        // Sheets: assigned (optional)
-        const f2 = parseOrderFields(s.summary || '');
+        // Sheets: assigned
         await postSheets('assigned', {
           ref: s.ref,
-          customer_name: f2.customerName || '',
-          phone: f2.phone || '',
-          area: f2.area || '',
-          map_url: f2.map || '',
-          total_etb: f2.total || '',
-          delivery_fee: f2.delivery || '',
+          customer_name: f.customerName || '',
+          phone: f.phone || '',
+          area: f.area || '',
+          map_url: f.map || '',
+          total_etb: f.total || '',
+          delivery_fee: f.delivery || '',
           payment_method: s.method || '',
           driver_id: d ? d.id : ctx.from.id,
           driver_name: d ? d.name : '',
@@ -527,7 +564,7 @@ bot.on('callback_query', async (ctx, next) => {
       if (s.assigned_driver_id !== ctx.from.id) return ctx.answerCbQuery('Not your job.');
 
       if (data.startsWith('drv_giveup:')) {
-        if (!s.giveupUntil || now() > s.giveupUntil) return ctx.answerCbQuery(get(MSG,'driver.giveup_too_late') || 'Too late.');
+        if (!s.giveupUntil || Date.now() > s.giveupUntil) return ctx.answerCbQuery(get(MSG,'driver.giveup_too_late') || 'Too late.');
         const quitterId = s.assigned_driver_id;
         s.assigned_driver_id = null; s.status = 'DISPATCHING'; s.giveupUntil = null;
         if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_canceled_rebroadcast', { REF: s.ref, USER_ID: quitterId }));
@@ -541,28 +578,36 @@ bot.on('callback_query', async (ctx, next) => {
         s.status = 'OUT_FOR_DELIVERY';
         await ctx.answerCbQuery(get(MSG,'driver.picked_marked') || 'Picked.');
         if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.picked_up', { REF: s.ref, USER_ID: ctx.from.id }));
-        const uid = s._customerId;
-        if (uid) await bot.telegram.sendMessage(uid, t('customer.picked_up', { REF: s.ref })).catch(()=>{});
-
-        // DB: picked timestamp
-        try { await recorder.recordPicked(s.ref); } catch (e) { console.error('recorder.recordPicked error', e.message); }
-
+        if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.picked_up', { REF: s.ref })).catch(()=>{});
         return;
       } else {
         s.status = 'DELIVERED';
         await ctx.answerCbQuery(get(MSG,'driver.delivered_marked') || 'Delivered.');
         if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.delivered', { REF: s.ref, USER_ID: ctx.from.id }));
-        const uid = s._customerId;
-        if (uid) await bot.telegram.sendMessage(uid, t('customer.delivered', { REF: s.ref })).catch(()=>{});
+        if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.delivered', { REF: s.ref })).catch(()=>{});
 
-        // DB: delivered timestamp
-        try { await recorder.recordDelivered(s.ref); } catch (e) { console.error('recorder.recordDelivered error', e.message); }
-
+        // Sheets: delivered
+        const f3 = parseOrderFields(s.summary || '');
+        const dInfo2 = drivers.get(ctx.from.id);
+        await postSheets('delivered', {
+          ref: s.ref,
+          customer_name: f3.customerName || '',
+          phone: f3.phone || '',
+          area: f3.area || '',
+          map_url: f3.map || '',
+          total_etb: f3.total || '',
+          delivery_fee: f3.delivery || '',
+          payment_method: s.method || '',
+          driver_id: dInfo2 ? dInfo2.id : ctx.from.id,
+          driver_name: dInfo2 ? dInfo2.name : '',
+          driver_phone: dInfo2 ? dInfo2.phone : '',
+          status: 'DELIVERED'
+        });
         return;
       }
     }
 
-    return next();
+    if (typeof next === 'function') return next();
   } catch (e) {
     console.error('callback_query error', e);
     return ctx.answerCbQuery('Error.');
@@ -571,20 +616,17 @@ bot.on('callback_query', async (ctx, next) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Finalize approval after hold (notify customer + dispatch)
-async function finalizeApproval(s, uid) {
+async function finalizeApproval(s) {
   try {
     if (!s || s.status !== 'APPROVED_HOLD') return;
     s.status = 'DISPATCHING';
     if (s.holdMsgId) {
       await bot.telegram.editMessageText(STAFF_GROUP_ID, s.holdMsgId, undefined, t('staff.finalize_approved', { REF: s.ref })).catch(()=>{});
     }
-    if (uid) await bot.telegram.sendMessage(uid, t('customer.payment_confirmed_after_hold', { REF: s.ref })).catch(()=>{});
+    // Customer DM was already sent on approve; we proceed to dispatch
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.dispatching_notice', { REF: s.ref }));
 
-    // DB: approved timestamp
-    try { await recorder.recordApproved(s.ref, s.summary || ''); } catch (err) { console.error('recorder.recordApproved error', err.message); }
-
-    // Sheets: approved (optional)
+    // Sheets: approved
     const f = parseOrderFields(s.summary || '');
     await postSheets('approved', {
       ref: s.ref,
@@ -609,7 +651,7 @@ async function finalizeApproval(s, uid) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Broadcast to drivers (includes customer phone line)
+// Driver broadcast (includes phone)
 async function broadcastToDrivers(s, excludeId = null) {
   if (drivers.size === 0) {
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, '⚠️ No drivers configured. Use /adddriver in owner DM.');
@@ -625,10 +667,10 @@ async function broadcastToDrivers(s, excludeId = null) {
     REF: s.ref, QTY: f.qty, AREA: f.area, TOTAL: f.total, DELIVERY_FEE: f.delivery, MAP_LINE: mapLine
   });
 
-  // prepend customer name and phone if available
-  const phoneLineTpl = get(MSG,'driver.phone_line') || '📞 {PHONE}';
+  // Prepend customer name if present
   if (f.customerName) card = `👤 ${f.customerName}\n` + card;
-  if (f.phone)        card = card + `\n` + phoneLineTpl.replace('{PHONE}', f.phone);
+  // ➕ include customer phone
+  if (f.phone) card += `\n📞 ${f.phone}`;
 
   const failed = [];
   const sent = [];
@@ -651,28 +693,34 @@ async function broadcastToDrivers(s, excludeId = null) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Wire customer DM flow module (handles intake, pay, receipt, TIN, supersede)
-const wireCustomerFlow = require('./flows/customerBotFlow');
-wireCustomerFlow(bot, {
-  FEATURES,
-  SUPPORT_PHONE,
-  SUPPORT_GROUP_ID,
-  STAFF_GROUP_ID,
-  BUTTON_TTL_SEC,
-  ALLOW_NEW_ORDER,
-  // parser
-  isLikelyQuestion,
-  isOrderSummaryStrict,
-  parseOrderFields,
-  extractRef,
-  // templating
-  t, get,
-  // session API
-  Session,
-  // misc
-  afterCutoff,
-  MSG
-});
+// Wire customer flow
+try {
+  const wireCustomerFlow = require('./flows/customerBotFlow');
+  wireCustomerFlow(bot, {
+    FEATURES,
+    SUPPORT_PHONE,
+    SUPPORT_GROUP_ID,
+    STAFF_GROUP_ID,
+    BUTTON_TTL_SEC,
+    ALLOW_NEW_ORDER,
+    // parser helpers
+    isLikelyQuestion,
+    isOrderSummaryStrict,
+    parseOrderFields,
+    extractRef,
+    // templating
+    t, get,
+    // session API
+    Session,
+    // misc
+    afterCutoff,
+    // expose MSG for flow (optional)
+    MSG
+  });
+  console.log('flows/customerBotFlow wired.');
+} catch (e) {
+  console.warn('flows/customerBotFlow missing — customer conversations will be inactive until you add it.');
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Launch
