@@ -71,12 +71,14 @@
     "delivered": "✅ Driver marked DELIVERED for {REF} — id {USER_ID}",
     "driver_canceled_rebroadcast": "⚠️ Driver (id {USER_ID}) gave up {REF}. Re-broadcasting…",
     "broadcast_report": "📣 Driver broadcast for {REF}\nSent to: {SENT}\nFailed: {FAILED}",
-    "broadcast_failed_hint": "⚠️ Couldn’t DM {COUNT} driver(s). They may have blocked the bot."
+    "broadcast_failed_hint": "⚠️ Couldn’t DM {COUNT} driver(s). They may have blocked the bot.",
+    "superseded_notice": "❗ Order {OLD_REF} canceled/superseded. New order pending ({NEW_REF})."
   },
   "driver": {
     "broadcast_card_am": "🧾 ትዕዛዝ {REF}\n• እቃ ብዛት: {QTY}\n• አካባቢ: {AREA}\n• ጠቅላላ ዋጋ: ETB {TOTAL}\n• ማጓጓዣ ክፍያ: ETB {DELIVERY_FEE}\n{MAP_LINE}",
     "broadcast_map_line_am": "📍 Map: {MAP_URL}",
     "assigned_card_am": "🚚 ተመድቧል — {REF}\n• እቃ ብዛት: {QTY}\n• አካባቢ: {AREA}\n• ጠቅላላ ዋጋ: ETB {TOTAL}\n• ማጓጓዣ ክፍያ: ETB {DELIVERY_FEE}\n{MAP_LINE}",
+    "phone_line": "📞 {PHONE}",
     "accept_you_already_have": "You already have this job.",
     "accept_already_assigned": "This job is already assigned.",
     "declined_ok": "Declined. Thank you.",
@@ -84,5 +86,9 @@
     "delivered_marked": "Delivered. Good job.",
     "giveup_ok": "You’ve given up this job.",
     "giveup_too_late": "Too late to give up this job."
+  },
+  "errors": {
+    "no_pending_new_order": "No new order found — please paste your new order again."
   }
 }
+
