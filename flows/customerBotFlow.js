@@ -30,14 +30,14 @@ module.exports = function wireCustomerFlow(bot, deps) {
 
   // ───────────────────────────────────────────────────────────────────────────
   // Config & guards
-  const RATE_LIMIT_MS   = Number(FEATURES?.ops?.rateLimitMs ?? 1500);
-  const STRICT_MODE     = !!(FEATURES?.intake?.strictMode ?? true);
-  const MIN_TEXT_LEN    = Number(FEATURES?.intake?.minTextLength ?? 50);
-  const ESCALATE_ON_Q   = !!(FEATURES?.intake?.escalateOnQuestion ?? true);
-  const DUP_FLAG        = !!(FEATURES?.flags?.flagDuplicateReceipts ?? true);
-  const FWD_FLAG        = !!(FEATURES?.flags?.flagForwardedReceipts ?? true);
-  const TIN_ENABLED     = !!(FEATURES?.flows?.tinEnabled ?? true);
-  const NOTIFY_SUPERSEDE= !!(FEATURES?.flags?.notifySupersede ?? true);
+  const RATE_LIMIT_MS    = Number(FEATURES?.ops?.rateLimitMs ?? 1500);
+  const STRICT_MODE      = !!(FEATURES?.intake?.strictMode ?? true);
+  const MIN_TEXT_LEN     = Number(FEATURES?.intake?.minTextLength ?? 50);
+  const ESCALATE_ON_Q    = !!(FEATURES?.intake?.escalateOnQuestion ?? true);
+  const DUP_FLAG         = !!(FEATURES?.flags?.flagDuplicateReceipts ?? true);
+  const FWD_FLAG         = !!(FEATURES?.flags?.flagForwardedReceipts ?? true);
+  const TIN_ENABLED      = !!(FEATURES?.flows?.tinEnabled ?? true);
+  const NOTIFY_SUPERSEDE = !!(FEATURES?.flags?.notifySupersede ?? true);
 
   const seenReceiptIds = new Set();
   const userRate = new Map();
@@ -114,19 +114,38 @@ module.exports = function wireCustomerFlow(bot, deps) {
     if (ctx.chat?.type !== 'private') return next && next();
     if ((ctx.message.text || '').startsWith('/')) return next && next();
 
-    if (rateLimited(ctx.from.id)) {
+    const uid = ctx.from.id;
+    if (rateLimited(uid)) {
       return ctx.reply(get(MSG,'customer.rate_limited') || 'Please wait a moment.');
     }
 
     const text = (ctx.message.text || '').trim();
-    const isQ = isLikelyQuestion(text);
+    let s = Session.getSession(uid);
 
+    // 🔒 Intercept: if we're expecting TIN text after user pressed "Yes", treat ANY text as TIN
+    if (s && s.awaitingTinExpectText === true) {
+      const tin = text.slice(0, 128); // accept anything, keep it short enough
+      s.tin = tin;
+      s.awaitingTinExpectText = false;
+      s.awaitingTin = false; // finished the optional TIN step
+
+      await ctx.reply(get(MSG,'customer.tin_saved') || 'TIN saved.');
+      if (STAFF_GROUP_ID) {
+        const prefix = get(MSG,'staff.tin_prefix') || 'TIN:';
+        // send as a follow-up message; does not affect approval flow
+        await bot.telegram.sendMessage(
+          STAFF_GROUP_ID,
+          `${prefix} ${tin}\nRef: ${s.ref}`
+        ).catch(()=>{});
+      }
+      return; // do not fall through to unidentified/support path
+    }
+
+    const isQ = isLikelyQuestion(text);
     const looksLikeOrder = isOrderSummaryStrict(text, {
-      strictMode: STRICT_MODE,
+      strictMode: !!STRICT_MODE,
       minTextLength: MIN_TEXT_LEN
     });
-
-    let s = Session.getSession(ctx.from.id);
 
     // No session yet
     if (!s) {
@@ -147,10 +166,10 @@ module.exports = function wireCustomerFlow(bot, deps) {
         holdMsgId: null,
         giveupUntil: null,
         createdAt: now(),
-        _customerId: ctx.from.id,
+        _customerId: uid
       };
-      Session.setSession(ctx.from.id, s);
-      Session.setRef(ref, ctx.from.id);
+      Session.setSession(uid, s);
+      Session.setRef(ref, uid);
       return sendSummaryWithPay(ctx, text, ref);
     }
 
@@ -160,12 +179,11 @@ module.exports = function wireCustomerFlow(bot, deps) {
         return ctx.reply(t('customer.order_in_progress_note', { REF: s.ref, SUPPORT_PHONE: SUPPORT_PHONE || '' }));
       }
 
-      // Cache the new summary on the *session*, not ctx.session
+      // Cache the new summary on the *session*
       s.pendingNewSummary = text;
 
-      // Ask to clear previous (works for AWAITING_RECEIPT and any other progress state)
-      const promptKey = 'customer.clear_previous_q';
-      return ctx.reply(t(promptKey, { REF: s.ref }) || 'Clear previous order?', clearAskKeyboard(s.ref));
+      // Ask to clear previous (works for any progress state)
+      return ctx.reply(t('customer.clear_previous_q', { REF: s.ref }) || 'Clear previous order?', clearAskKeyboard(s.ref));
     }
 
     // Not an order text
@@ -178,12 +196,13 @@ module.exports = function wireCustomerFlow(bot, deps) {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // PHOTO (receipt)
+  // PHOTO (receipt) — POST FIRST, THEN ASK TIN (optional)
 
   bot.on('photo', async (ctx) => {
     if (ctx.chat?.type !== 'private') return;
 
-    const s = Session.getSession(ctx.from.id);
+    const uid = ctx.from.id;
+    const s = Session.getSession(uid);
     if (!s || s.status !== 'AWAITING_RECEIPT') {
       return ctx.reply(get(MSG,'customer.awaiting_receipt_text') || 'Send receipt photo after choosing payment.');
     }
@@ -206,14 +225,15 @@ module.exports = function wireCustomerFlow(bot, deps) {
       if (isFwd) flags.push('⚠️ Forwarded receipt');
     }
 
-    if (TIN_ENABLED) {
-      s.status = 'AWAITING_TIN';
-      s._receiptFlags = flags;
-      await ctx.reply(get(MSG,'customer.tin_ask') || 'Do you have a TIN to use for this order?', tinAskKeyboard(s.ref));
-      return;
-    }
-
+    // ✅ POST RECEIPT TO STAFF IMMEDIATELY — DO NOT WAIT FOR TIN
     await postReceiptToStaff(ctx, s, { flags });
+
+    // Then (optionally) ask for TIN without blocking approvals
+    if (TIN_ENABLED) {
+      s.awaitingTin = true;
+      s.awaitingTinExpectText = false; // will be set true only if user taps Yes
+      await ctx.reply(get(MSG,'customer.tin_ask') || 'Do you have a TIN to use for this order?', tinAskKeyboard(s.ref));
+    }
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -222,6 +242,7 @@ module.exports = function wireCustomerFlow(bot, deps) {
   bot.on('callback_query', async (ctx, next) => {
     try {
       const data = String(ctx.callbackQuery.data || '');
+      const uid = ctx.from.id;
 
       // Payment choice
       if (data.startsWith('pay:')) {
@@ -255,8 +276,7 @@ module.exports = function wireCustomerFlow(bot, deps) {
       // Clear previous?
       if (data.startsWith('clearprev:')) {
         const [, yn, oldRef] = data.split(':');
-        // Try resolve the user's current session and the one by ref
-        const sUser = Session.getSession(ctx.from.id);
+        const sUser = Session.getSession(uid);
         const sOld  = Session.getSessionByRef(oldRef) || sUser;
         const pendingText = sOld?.pendingNewSummary;
 
@@ -269,14 +289,12 @@ module.exports = function wireCustomerFlow(bot, deps) {
         // Close/supersede old and promote new
         const newRef = Session.genRef();
 
-        // Remove old ref mapping
         if (sOld?.ref) {
           try { Session.deleteRef(sOld.ref); } catch {}
           sOld.supersededRefs = Array.isArray(sOld.supersededRefs) ? sOld.supersededRefs : [];
           sOld.supersededRefs.push(sOld.ref);
         }
 
-        // Overwrite user's session with the new one
         const sNew = {
           ref: newRef,
           summary: pendingText,
@@ -288,18 +306,15 @@ module.exports = function wireCustomerFlow(bot, deps) {
           holdMsgId: null,
           giveupUntil: null,
           createdAt: now(),
-          _customerId: ctx.from.id
+          _customerId: uid
         };
-        Session.setSession(ctx.from.id, sNew);
-        Session.setRef(newRef, ctx.from.id);
+        Session.setSession(uid, sNew);
+        Session.setRef(newRef, uid);
 
-        // Clear the temp field on the old holder (if same object)
         if (sOld) delete sOld.pendingNewSummary;
 
-        // Customer confirmation text
         if (yn === 'yes') {
           await ctx.editMessageText((get(MSG,'customer.previous_cleared') || 'Previous order cleared.') + ` ${t('customer.new_order_ready', { REF: newRef })}`).catch(()=>{});
-          // Staff notice
           if (NOTIFY_SUPERSEDE && STAFF_GROUP_ID) {
             await bot.telegram.sendMessage(
               STAFF_GROUP_ID,
@@ -314,24 +329,23 @@ module.exports = function wireCustomerFlow(bot, deps) {
         return;
       }
 
-      // TIN ask result
+      // TIN ask result — does NOT block approvals
       if (data.startsWith('tinask:')) {
         const [, yn, ref] = data.split(':');
         const s = Session.getSessionByRef(ref);
         if (!s) return ctx.answerCbQuery('No active order.');
-        if (!s.receiptFileId) return ctx.answerCbQuery('No receipt found.');
 
         if (yn === 'yes') {
-          s.status = 'AWAITING_TIN_TEXT';
+          s.awaitingTin = true;
+          s.awaitingTinExpectText = true; // any next text = TIN
           await ctx.editMessageText(get(MSG,'customer.tin_prompt') || 'Please send your TIN number.').catch(()=>{});
           await ctx.answerCbQuery('Okay.');
           return;
         } else {
-          await ctx.answerCbQuery('Okay.');
+          s.awaitingTin = false;
+          s.awaitingTinExpectText = false;
           await ctx.editMessageText(get(MSG,'customer.tin_skip') || 'No TIN used.').catch(()=>{});
-          const flags = s._receiptFlags || [];
-          delete s._receiptFlags;
-          await postReceiptToStaff(ctx, s, { flags });
+          await ctx.answerCbQuery('Okay.');
           return;
         }
       }
@@ -344,38 +358,11 @@ module.exports = function wireCustomerFlow(bot, deps) {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TIN text capture
-
-  bot.on('message', async (ctx, next) => {
-    if (ctx.chat?.type !== 'private') return next && next();
-    if (ctx.message.photo || (ctx.message.text || '').startsWith('/')) return next && next();
-
-    const s = Session.getSession(ctx.from.id);
-    if (!s) return next && next();
-
-    if (s.status === 'AWAITING_TIN_TEXT') {
-      const tin = (ctx.message.text || '').trim().slice(0, 64);
-      if (!tin) return ctx.reply(get(MSG,'customer.tin_retry') || 'Please send a valid TIN.');
-      s.tin = tin;
-      const flags = s._receiptFlags || [];
-      delete s._receiptFlags;
-      await ctx.reply(get(MSG,'customer.tin_saved') || 'TIN saved.');
-      return postReceiptToStaff(ctx, s, { flags });
-    }
-
-    if (s.status === 'AWAITING_RECEIPT') {
-      return ctx.reply(get(MSG,'customer.awaiting_receipt_text') || 'Send receipt photo.');
-    }
-
-    return next && next();
-  });
-
-  // ───────────────────────────────────────────────────────────────────────────
-  // Staff posting
+  // Staff posting — used on receipt; sets AWAITING_REVIEW and posts immediately
 
   async function postReceiptToStaff(ctx, s, { flags = [] } = {}) {
     try {
-      s.status = 'AWAITING_REVIEW';
+      s.status = 'AWAITING_REVIEW'; // ready for staff approve/reject
 
       const caption = [
         t('staff.receipt_caption', {
@@ -385,7 +372,6 @@ module.exports = function wireCustomerFlow(bot, deps) {
           USERNAME: ctx.from.username ? '@' + ctx.from.username : 'no_username',
           USER_ID: ctx.from.id
         }),
-        s.tin ? `${get(MSG,'staff.tin_prefix') || 'TIN:'} ${s.tin}` : '',
         flags.length ? `${get(MSG,'staff.receipt_flags_prefix') || 'Flags:'} ${flags.join(' | ')}` : ''
       ].filter(Boolean).join('\n');
 
@@ -402,7 +388,6 @@ module.exports = function wireCustomerFlow(bot, deps) {
         (get(MSG,'staff.order_summary_prefix') || '🧾 Order Summary:\n') + (s.summary || '').slice(0, 4000)
       );
       await ctx.reply(t('customer.receipt_received', { REF: s.ref }) || 'We received your receipt.');
-
     } catch (err) {
       console.error('postReceiptToStaff error', err);
       await ctx.reply('There was an issue posting your receipt. Our team has been notified.').catch(()=>{});
