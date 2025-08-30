@@ -1,7 +1,8 @@
-// flows/customerBotFlow.js — all customer-facing conversation & payment flow
+// flows/customerBotFlow.js — all customer-facing conversation & payment flow (DB-wired)
 'use strict';
 
 const { Markup } = require('telegraf');
+const recorder = require('../data/recorder'); // Render Postgres recorder
 
 module.exports = function wireCustomerFlow(bot, deps) {
   const {
@@ -124,21 +125,20 @@ module.exports = function wireCustomerFlow(bot, deps) {
 
     // 🔒 Intercept: if we're expecting TIN text after user pressed "Yes", treat ANY text as TIN
     if (s && s.awaitingTinExpectText === true) {
-      const tin = text.slice(0, 128); // accept anything, keep it short enough
+      const tin = text.slice(0, 128); // accept anything, bounded length
       s.tin = tin;
       s.awaitingTinExpectText = false;
-      s.awaitingTin = false; // finished the optional TIN step
+      s.awaitingTin = false; // finish optional TIN
 
       await ctx.reply(get(MSG,'customer.tin_saved') || 'TIN saved.');
       if (STAFF_GROUP_ID) {
         const prefix = get(MSG,'staff.tin_prefix') || 'TIN:';
-        // send as a follow-up message; does not affect approval flow
         await bot.telegram.sendMessage(
           STAFF_GROUP_ID,
           `${prefix} ${tin}\nRef: ${s.ref}`
         ).catch(()=>{});
       }
-      return; // do not fall through to unidentified/support path
+      return; // do not fall through
     }
 
     const isQ = isLikelyQuestion(text);
@@ -153,7 +153,7 @@ module.exports = function wireCustomerFlow(bot, deps) {
         if (isQ && ESCALATE_ON_Q) return escalateToSupport(ctx, text);
         return ctx.reply(t('customer.invalid_intake', { SUPPORT_PHONE: SUPPORT_PHONE || '' }));
       }
-      // New order: create
+      // New order: create session
       const ref = Session.genRef();
       s = {
         ref,
@@ -170,19 +170,20 @@ module.exports = function wireCustomerFlow(bot, deps) {
       };
       Session.setSession(uid, s);
       Session.setRef(ref, uid);
+
+      // DB: intake snapshot
+      try { await recorder.recordIntake(text, { ref }); } catch (e) { console.error('recorder.recordIntake error', e.message); }
+
       return sendSummaryWithPay(ctx, text, ref);
     }
 
-    // Existing session present
+    // Existing session present, user pasted a *new* order
     if (looksLikeOrder) {
       if (!ALLOW_NEW_ORDER) {
         return ctx.reply(t('customer.order_in_progress_note', { REF: s.ref, SUPPORT_PHONE: SUPPORT_PHONE || '' }));
       }
-
-      // Cache the new summary on the *session*
+      // cache new summary and ask clear/keep
       s.pendingNewSummary = text;
-
-      // Ask to clear previous (works for any progress state)
       return ctx.reply(t('customer.clear_previous_q', { REF: s.ref }) || 'Clear previous order?', clearAskKeyboard(s.ref));
     }
 
@@ -228,6 +229,9 @@ module.exports = function wireCustomerFlow(bot, deps) {
     // ✅ POST RECEIPT TO STAFF IMMEDIATELY — DO NOT WAIT FOR TIN
     await postReceiptToStaff(ctx, s, { flags });
 
+    // DB: receipt posted event
+    try { await recorder.recordReceiptPosted(s.ref, s.summary || ''); } catch (e) { console.error('recorder.recordReceiptPosted error', e.message); }
+
     // Then (optionally) ask for TIN without blocking approvals
     if (TIN_ENABLED) {
       s.awaitingTin = true;
@@ -270,6 +274,10 @@ module.exports = function wireCustomerFlow(bot, deps) {
             })
           );
         }
+
+        // DB: payment selected
+        try { await recorder.recordPaymentSelected(s.ref, s.summary || '', s.method); } catch (e) { console.error('recorder.recordPaymentSelected error', e.message); }
+
         return;
       }
 
@@ -324,6 +332,9 @@ module.exports = function wireCustomerFlow(bot, deps) {
         } else {
           await ctx.editMessageText((get(MSG,'customer.previous_archived') || 'Continuing with a new order.') + ` ${t('customer.new_order_ready', { REF: newRef })}`).catch(()=>{});
         }
+
+        // DB: intake snapshot for the new order
+        try { await recorder.recordIntake(pendingText, { ref: newRef }); } catch (e) { console.error('recorder.recordIntake (supersede) error', e.message); }
 
         await sendSummaryWithPay(ctx, pendingText, newRef);
         return;
