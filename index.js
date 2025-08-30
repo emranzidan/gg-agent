@@ -727,3 +727,50 @@ try {
 bot.launch().then(() => console.log('Polling started…'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// ─────────────────────────────────────────────────────────────────────────────
+// HOLD-FIX OVERRIDE (paste-and-go)
+// Ensures customer DM ("payment confirmed") is only sent AFTER the full hold window.
+// Works without changing the existing approve/undo code paths.
+
+(function holdFixOverride() {
+  if (typeof finalizeApproval !== 'function') return; // safety
+
+  const originalFinalize = finalizeApproval;
+
+  finalizeApproval = async function (s, uid) {
+    try {
+      if (!s) return;
+      // Only manage while we're on hold
+      if (s.status !== 'APPROVED_HOLD') return;
+
+      const needed = (typeof HOLD_SECONDS === 'number' && HOLD_SECONDS > 0 ? HOLD_SECONDS : 60) * 1000;
+
+      // If no start marker yet, set it and schedule; do NOT DM now
+      if (!s.holdActivatedAt) {
+        s.holdActivatedAt = Date.now();
+        if (s.approvalTimer) { try { clearTimeout(s.approvalTimer); } catch {} s.approvalTimer = null; }
+        s.approvalTimer = setTimeout(() => finalizeApproval(s, uid).catch(()=>{}), needed);
+        return;
+      }
+
+      // If called early, re-schedule for the remaining time; do NOT DM
+      const elapsed = Date.now() - s.holdActivatedAt;
+      if (elapsed < needed) {
+        const left = needed - elapsed;
+        if (s.approvalTimer) { try { clearTimeout(s.approvalTimer); } catch {} s.approvalTimer = null; }
+        s.approvalTimer = setTimeout(() => finalizeApproval(s, uid).catch(()=>{}), left);
+        return;
+      }
+
+      // Fire only once
+      if (s.confirmationSent) return;
+      s.confirmationSent = true;
+
+      // Delegate to original finalize (this sends the DM + dispatch)
+      return originalFinalize.call(this, s, uid);
+    } catch (e) {
+      console.error('holdFixOverride finalizeApproval error:', e);
+    }
+  };
+})();
+
