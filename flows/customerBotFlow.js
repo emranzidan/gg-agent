@@ -22,31 +22,65 @@ module.exports = function wireCustomerFlow(bot, deps) {
     Session,
     // misc
     afterCutoff,
+    // optional raw messages
+    MSG: RAW_MSG
   } = deps;
 
-  const rateLimitMs = (FEATURES && FEATURES.ops && FEATURES.ops.rateLimitMs) || 1500;
-  const userRate = new Map();
-  const DUP_FLAG = !!(FEATURES && FEATURES.flags && FEATURES.flags.flagDuplicateReceipts);
-  const FWD_FLAG = !!(FEATURES && FEATURES.flags && FEATURES.flags.flagForwardedReceipts);
-  const TIN_ENABLED = !!(FEATURES && FEATURES.flows && FEATURES.flows.tinEnabled);
+  const MSG = RAW_MSG || {};
 
-  function now() { return Date.now(); }
+  // ───────────────────────────────────────────────────────────────────────────
+  // Config & guards
+  const RATE_LIMIT_MS   = Number(FEATURES?.ops?.rateLimitMs ?? 1500);
+  const STRICT_MODE     = !!(FEATURES?.intake?.strictMode ?? true);
+  const MIN_TEXT_LEN    = Number(FEATURES?.intake?.minTextLength ?? 50);
+  const ESCALATE_ON_Q   = !!(FEATURES?.intake?.escalateOnQuestion ?? true);
+  const DUP_FLAG        = !!(FEATURES?.flags?.flagDuplicateReceipts ?? true);
+  const FWD_FLAG        = !!(FEATURES?.flags?.flagForwardedReceipts ?? true);
+  const TIN_ENABLED     = !!(FEATURES?.flows?.tinEnabled ?? true);
+  const NOTIFY_SUPERSEDE= !!(FEATURES?.flags?.notifySupersede ?? true);
+
+  const seenReceiptIds = new Set();
+  const userRate = new Map();
+  const now = () => Date.now();
+
   function rateLimited(uid) {
     const last = userRate.get(uid) || 0;
-    const ok = now() - last >= rateLimitMs;
+    const ok = now() - last >= RATE_LIMIT_MS;
     if (ok) userRate.set(uid, now());
     return !ok;
   }
 
   function supportEnabled() {
-    return !!(FEATURES && FEATURES.support && FEATURES.support.enabled && SUPPORT_GROUP_ID);
+    return !!(FEATURES?.support?.enabled && SUPPORT_GROUP_ID);
   }
 
-  // ========== helpers ==========
+  // ───────────────────────────────────────────────────────────────────────────
+  // UI helpers
+
+  function clearAskKeyboard(ref) {
+    return Markup.inlineKeyboard([
+      [
+        Markup.button.callback(get(MSG,'buttons.clear_prev_yes') || 'Clear previous', `clearprev:yes:${ref}`),
+        Markup.button.callback(get(MSG,'buttons.clear_prev_no')  || 'Keep & continue', `clearprev:no:${ref}`)
+      ]
+    ]);
+  }
+
+  function tinAskKeyboard(ref) {
+    return Markup.inlineKeyboard([
+      [
+        Markup.button.callback(get(MSG,'buttons.tin_yes') || 'Yes, I have TIN', `tinask:yes:${ref}`),
+        Markup.button.callback(get(MSG,'buttons.tin_no')  || 'No',              `tinask:no:${ref}`)
+      ]
+    ]);
+  }
+
   async function sendSummaryWithPay(ctx, summary, ref) {
     const kb = Markup.inlineKeyboard([
-      [Markup.button.callback(get(MSG,'buttons.payment_telebirr') || 'Telebirr', `pay:telebirr:${ref}`),
-       Markup.button.callback(get(MSG,'buttons.payment_cbe') || 'CBE Bank', `pay:bank:${ref}`)]
+      [
+        Markup.button.callback(get(MSG,'buttons.payment_telebirr') || 'Telebirr', `pay:telebirr:${ref}`),
+        Markup.button.callback(get(MSG,'buttons.payment_cbe')      || 'CBE Bank', `pay:bank:${ref}`)
+      ]
     ]);
     const welcomeKey = afterCutoff() ? 'customer.welcome_after_cutoff' : 'customer.welcome';
     await ctx.reply(t(welcomeKey, { REF: ref }), kb);
@@ -70,31 +104,12 @@ module.exports = function wireCustomerFlow(bot, deps) {
       }),
       kb
     );
-    return ctx.reply(t('customer.support_forward_ack', { SUPPORT_PHONE: SUPPORT_PHONE || '' }));
+    return ctx.reply(t('support.customer_claim_dm', { SUPPORT_PHONE: SUPPORT_PHONE || '' }));
   }
 
-  function clearAskKeyboard(ref) {
-    return Markup.inlineKeyboard([
-      [
-        Markup.button.callback(get(MSG,'buttons.clear_prev_yes') || 'Clear previous', `clearprev:yes:${ref}`),
-        Markup.button.callback(get(MSG,'buttons.clear_prev_no')  || 'Keep & continue', `clearprev:no:${ref}`)
-      ]
-    ]);
-  }
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEXT (customer DM)
 
-  function tinAskKeyboard(ref) {
-    return Markup.inlineKeyboard([
-      [
-        Markup.button.callback(get(MSG,'buttons.tin_yes') || 'Yes, I have TIN', `tinask:yes:${ref}`),
-        Markup.button.callback(get(MSG,'buttons.tin_no')  || 'No',              `tinask:no:${ref}`)
-      ]
-    ]);
-  }
-
-  // NOTE: reference to MSG via get/t; keep safe if missing
-  const MSG = deps.MSG || {};
-
-  // ========== TEXT (customer DM) ==========
   bot.on('text', async (ctx, next) => {
     if (ctx.chat?.type !== 'private') return next && next();
     if ((ctx.message.text || '').startsWith('/')) return next && next();
@@ -106,41 +121,22 @@ module.exports = function wireCustomerFlow(bot, deps) {
     const text = (ctx.message.text || '').trim();
     const isQ = isLikelyQuestion(text);
 
-    // existing session?
-    const existing = Session.getSession(ctx.from.id);
     const looksLikeOrder = isOrderSummaryStrict(text, {
-      strictMode: FEATURES?.intake?.strictMode ?? true,
-      minTextLength: FEATURES?.intake?.minTextLength ?? 50
+      strictMode: STRICT_MODE,
+      minTextLength: MIN_TEXT_LEN
     });
 
-    if (existing) {
-      // if they ask a question during an active flow, escalate if configured
+    let s = Session.getSession(ctx.from.id);
+
+    // No session yet
+    if (!s) {
       if (!looksLikeOrder) {
-        if (existing.status === 'AWAITING_RECEIPT') {
-          return ctx.reply(get(MSG,'customer.awaiting_receipt_text') || 'Send receipt photo.');
-        }
-        if (isQ && (FEATURES?.intake?.escalateOnQuestion)) {
-          return escalateToSupport(ctx, text);
-        }
-        return ctx.reply(t('customer.order_in_progress_note', { REF: existing.ref, SUPPORT_PHONE: SUPPORT_PHONE || '' }));
+        if (isQ && ESCALATE_ON_Q) return escalateToSupport(ctx, text);
+        return ctx.reply(t('customer.invalid_intake', { SUPPORT_PHONE: SUPPORT_PHONE || '' }));
       }
-
-      // New order summary arrives mid-flow
-      if (!ALLOW_NEW_ORDER) {
-        return ctx.reply(t('customer.order_in_progress_note', { REF: existing.ref, SUPPORT_PHONE: SUPPORT_PHONE || '' }));
-      }
-
-      // If awaiting receipt, ask to clear previous (no screenshot yet)
-      if (existing.status === 'AWAITING_RECEIPT') {
-        const tmpRef = existing.ref; // show the old ref for context
-        ctx.session = { pendingNewSummary: text }; // stash in Telegraf context
-        return ctx.reply(t('customer.clear_previous_q', { REF: tmpRef }) || 'Clear previous order?', clearAskKeyboard(tmpRef));
-      }
-
-      // Otherwise, replace seamlessly (treat as reorder)
-      // archive old by simply overwriting the session (one-session-per-user model)
+      // New order: create
       const ref = Session.genRef();
-      Session.setSession(ctx.from.id, {
+      s = {
         ref,
         summary: text,
         status: 'AWAITING_PAYMENT',
@@ -150,39 +146,43 @@ module.exports = function wireCustomerFlow(bot, deps) {
         approvalTimer: null,
         holdMsgId: null,
         giveupUntil: null,
-        createdAt: Date.now(),
-      });
+        createdAt: now(),
+        _customerId: ctx.from.id,
+      };
+      Session.setSession(ctx.from.id, s);
       Session.setRef(ref, ctx.from.id);
       return sendSummaryWithPay(ctx, text, ref);
     }
 
-    // No session yet
-    if (!looksLikeOrder) {
-      if (isQ && (FEATURES?.intake?.escalateOnQuestion)) return escalateToSupport(ctx, text);
-      return ctx.reply(t('customer.invalid_intake', { SUPPORT_PHONE: SUPPORT_PHONE || '' }));
+    // Existing session present
+    if (looksLikeOrder) {
+      if (!ALLOW_NEW_ORDER) {
+        return ctx.reply(t('customer.order_in_progress_note', { REF: s.ref, SUPPORT_PHONE: SUPPORT_PHONE || '' }));
+      }
+
+      // Cache the new summary on the *session*, not ctx.session
+      s.pendingNewSummary = text;
+
+      // Ask to clear previous (works for AWAITING_RECEIPT and any other progress state)
+      const promptKey = 'customer.clear_previous_q';
+      return ctx.reply(t(promptKey, { REF: s.ref }) || 'Clear previous order?', clearAskKeyboard(s.ref));
     }
 
-    // New order session
-    const ref = Session.genRef();
-    Session.setSession(ctx.from.id, {
-      ref,
-      summary: text,
-      status: 'AWAITING_PAYMENT',
-      method: null,
-      assigned_driver_id: null,
-      driverTimer: null,
-      approvalTimer: null,
-      holdMsgId: null,
-      giveupUntil: null,
-      createdAt: Date.now(),
-    });
-    Session.setRef(ref, ctx.from.id);
-    await sendSummaryWithPay(ctx, text, ref);
+    // Not an order text
+    if (s.status === 'AWAITING_RECEIPT') {
+      return ctx.reply(get(MSG,'customer.awaiting_receipt_text') || 'Send receipt photo.');
+    }
+    if (isQ && ESCALATE_ON_Q) return escalateToSupport(ctx, text);
+
+    return ctx.reply(t('customer.order_in_progress_note', { REF: s.ref, SUPPORT_PHONE: SUPPORT_PHONE || '' }));
   });
 
-  // ========== RECEIPT PHOTO ==========
+  // ───────────────────────────────────────────────────────────────────────────
+  // PHOTO (receipt)
+
   bot.on('photo', async (ctx) => {
     if (ctx.chat?.type !== 'private') return;
+
     const s = Session.getSession(ctx.from.id);
     if (!s || s.status !== 'AWAITING_RECEIPT') {
       return ctx.reply(get(MSG,'customer.awaiting_receipt_text') || 'Send receipt photo after choosing payment.');
@@ -197,11 +197,8 @@ module.exports = function wireCustomerFlow(bot, deps) {
 
     const flags = [];
     if (DUP_FLAG) {
-      // simple per-process duplicate memory; restart resets
-      ctx.state = ctx.state || {};
-      ctx.state.seenReceiptIds = ctx.state.seenReceiptIds || new Set();
-      const isDup = ctx.state.seenReceiptIds.has(fileId);
-      ctx.state.seenReceiptIds.add(fileId);
+      const isDup = seenReceiptIds.has(fileId);
+      seenReceiptIds.add(fileId);
       if (isDup) flags.push('⚠️ Duplicate receipt (same photo sent before)');
     }
     if (FWD_FLAG) {
@@ -209,7 +206,6 @@ module.exports = function wireCustomerFlow(bot, deps) {
       if (isFwd) flags.push('⚠️ Forwarded receipt');
     }
 
-    // Ask TIN first (if enabled), otherwise post to staff immediately
     if (TIN_ENABLED) {
       s.status = 'AWAITING_TIN';
       s._receiptFlags = flags;
@@ -220,7 +216,9 @@ module.exports = function wireCustomerFlow(bot, deps) {
     await postReceiptToStaff(ctx, s, { flags });
   });
 
-  // ========== CALLBACKS (customer) ==========
+  // ───────────────────────────────────────────────────────────────────────────
+  // CALLBACKS (customer)
+
   bot.on('callback_query', async (ctx, next) => {
     try {
       const data = String(ctx.callbackQuery.data || '');
@@ -257,24 +255,30 @@ module.exports = function wireCustomerFlow(bot, deps) {
       // Clear previous?
       if (data.startsWith('clearprev:')) {
         const [, yn, oldRef] = data.split(':');
-        const pendingText = ctx.session?.pendingNewSummary;
-        ctx.session = {}; // clear temp
+        // Try resolve the user's current session and the one by ref
+        const sUser = Session.getSession(ctx.from.id);
+        const sOld  = Session.getSessionByRef(oldRef) || sUser;
+        const pendingText = sOld?.pendingNewSummary;
+
         if (!pendingText) {
           await ctx.answerCbQuery('No new order found.');
+          await ctx.editMessageText(get(MSG,'errors.no_pending_new_order') || 'No new order found — please paste your new order again.').catch(()=>{});
           return;
         }
 
-        // In all cases we will replace (single-session model).
-        const old = Session.getSessionByRef(oldRef);
-        if (old) {
-          Session.deleteRef(old.ref);
-          const uid = ctx.from.id;
-          Session.deleteSession(uid);
+        // Close/supersede old and promote new
+        const newRef = Session.genRef();
+
+        // Remove old ref mapping
+        if (sOld?.ref) {
+          try { Session.deleteRef(sOld.ref); } catch {}
+          sOld.supersededRefs = Array.isArray(sOld.supersededRefs) ? sOld.supersededRefs : [];
+          sOld.supersededRefs.push(sOld.ref);
         }
 
-        const ref = Session.genRef();
-        Session.setSession(ctx.from.id, {
-          ref,
+        // Overwrite user's session with the new one
+        const sNew = {
+          ref: newRef,
           summary: pendingText,
           status: 'AWAITING_PAYMENT',
           method: null,
@@ -283,16 +287,30 @@ module.exports = function wireCustomerFlow(bot, deps) {
           approvalTimer: null,
           holdMsgId: null,
           giveupUntil: null,
-          createdAt: Date.now(),
-        });
-        Session.setRef(ref, ctx.from.id);
+          createdAt: now(),
+          _customerId: ctx.from.id
+        };
+        Session.setSession(ctx.from.id, sNew);
+        Session.setRef(newRef, ctx.from.id);
 
+        // Clear the temp field on the old holder (if same object)
+        if (sOld) delete sOld.pendingNewSummary;
+
+        // Customer confirmation text
         if (yn === 'yes') {
-          await ctx.editMessageText((get(MSG,'customer.previous_cleared') || 'Previous order cleared.') + ` ${t('customer.new_order_ready', { REF: ref })}`);
+          await ctx.editMessageText((get(MSG,'customer.previous_cleared') || 'Previous order cleared.') + ` ${t('customer.new_order_ready', { REF: newRef })}`).catch(()=>{});
+          // Staff notice
+          if (NOTIFY_SUPERSEDE && STAFF_GROUP_ID) {
+            await bot.telegram.sendMessage(
+              STAFF_GROUP_ID,
+              t('staff.superseded_notice', { OLD_REF: oldRef, NEW_REF: newRef }) || `❗ Order ${oldRef} canceled/superseded. New order pending (${newRef}).`
+            ).catch(()=>{});
+          }
         } else {
-          await ctx.editMessageText((get(MSG,'customer.previous_archived') || 'Continuing with a new order.') + ` ${t('customer.new_order_ready', { REF: ref })}`);
+          await ctx.editMessageText((get(MSG,'customer.previous_archived') || 'Continuing with a new order.') + ` ${t('customer.new_order_ready', { REF: newRef })}`).catch(()=>{});
         }
-        await sendSummaryWithPay(ctx, pendingText, ref);
+
+        await sendSummaryWithPay(ctx, pendingText, newRef);
         return;
       }
 
@@ -305,13 +323,12 @@ module.exports = function wireCustomerFlow(bot, deps) {
 
         if (yn === 'yes') {
           s.status = 'AWAITING_TIN_TEXT';
-          await ctx.editMessageText(get(MSG,'customer.tin_prompt') || 'Please send your TIN number.');
+          await ctx.editMessageText(get(MSG,'customer.tin_prompt') || 'Please send your TIN number.').catch(()=>{});
           await ctx.answerCbQuery('Okay.');
           return;
         } else {
-          // No TIN → post now
           await ctx.answerCbQuery('Okay.');
-          await ctx.editMessageText(get(MSG,'customer.tin_skip') || 'No TIN used.');
+          await ctx.editMessageText(get(MSG,'customer.tin_skip') || 'No TIN used.').catch(()=>{});
           const flags = s._receiptFlags || [];
           delete s._receiptFlags;
           await postReceiptToStaff(ctx, s, { flags });
@@ -326,7 +343,9 @@ module.exports = function wireCustomerFlow(bot, deps) {
     }
   });
 
-  // ========== TIN text capture ==========
+  // ───────────────────────────────────────────────────────────────────────────
+  // TIN text capture
+
   bot.on('message', async (ctx, next) => {
     if (ctx.chat?.type !== 'private') return next && next();
     if (ctx.message.photo || (ctx.message.text || '').startsWith('/')) return next && next();
@@ -351,31 +370,45 @@ module.exports = function wireCustomerFlow(bot, deps) {
     return next && next();
   });
 
-  // ========== staff posting ==========
+  // ───────────────────────────────────────────────────────────────────────────
+  // Staff posting
+
   async function postReceiptToStaff(ctx, s, { flags = [] } = {}) {
-    s.status = 'AWAITING_REVIEW';
-    const caption = [
-      t('staff.receipt_caption', {
-        REF: s.ref,
-        METHOD: s.method || '—',
-        CUSTOMER_NAME: `${ctx.from.first_name || ''} ${ctx.from.last_name || ''}`.trim(),
-        USERNAME: ctx.from.username ? '@' + ctx.from.username : 'no_username',
-        USER_ID: ctx.from.id
-      }),
-      s.tin ? `${get(MSG,'staff.tin_prefix') || 'TIN:'} ${s.tin}` : '',
-      flags.length ? `${get(MSG,'staff.receipt_flags_prefix') || 'Flags:'} ${flags.join(' | ')}` : ''
-    ].filter(Boolean).join('\n');
+    try {
+      s.status = 'AWAITING_REVIEW';
 
-    const actions = Markup.inlineKeyboard([
-      [Markup.button.callback(get(MSG,'buttons.approve') || 'Approve ✅', `approve:${ctx.from.id}:${s.ref}`),
-       Markup.button.callback(get(MSG,'buttons.reject')  || 'Reject ❌',  `reject:${ctx.from.id}:${s.ref}`)]
-    ]);
+      const caption = [
+        t('staff.receipt_caption', {
+          REF: s.ref,
+          METHOD: s.method || '—',
+          CUSTOMER_NAME: `${ctx.from.first_name || ''} ${ctx.from.last_name || ''}`.trim(),
+          USERNAME: ctx.from.username ? '@' + ctx.from.username : 'no_username',
+          USER_ID: ctx.from.id
+        }),
+        s.tin ? `${get(MSG,'staff.tin_prefix') || 'TIN:'} ${s.tin}` : '',
+        flags.length ? `${get(MSG,'staff.receipt_flags_prefix') || 'Flags:'} ${flags.join(' | ')}` : ''
+      ].filter(Boolean).join('\n');
 
-    await ctx.telegram.sendPhoto(STAFF_GROUP_ID, s.receiptFileId, { caption, ...actions });
-    await ctx.telegram.sendMessage(
-      STAFF_GROUP_ID,
-      (get(MSG,'staff.order_summary_prefix') || '🧾 Order Summary:\n').replace('{REF}', s.ref) + (s.summary || '').slice(0, 4000)
-    );
-    await ctx.reply(t('customer.receipt_received', { REF: s.ref }) || 'We received your receipt.');
+      const actions = Markup.inlineKeyboard([
+        [
+          Markup.button.callback(get(MSG,'buttons.approve') || 'Approve ✅', `approve:${ctx.from.id}:${s.ref}`),
+          Markup.button.callback(get(MSG,'buttons.reject')  || 'Reject ❌',  `reject:${ctx.from.id}:${s.ref}`)
+        ]
+      ]);
+
+      await ctx.telegram.sendPhoto(STAFF_GROUP_ID, s.receiptFileId, { caption, ...actions });
+      await ctx.telegram.sendMessage(
+        STAFF_GROUP_ID,
+        (get(MSG,'staff.order_summary_prefix') || '🧾 Order Summary:\n') + (s.summary || '').slice(0, 4000)
+      );
+      await ctx.reply(t('customer.receipt_received', { REF: s.ref }) || 'We received your receipt.');
+
+    } catch (err) {
+      console.error('postReceiptToStaff error', err);
+      await ctx.reply('There was an issue posting your receipt. Our team has been notified.').catch(()=>{});
+      if (STAFF_GROUP_ID) {
+        await bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Error posting receipt for ${s.ref || 'ref'} — please check logs.`).catch(()=>{});
+      }
+    }
   }
 };
