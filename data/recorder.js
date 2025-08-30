@@ -1,8 +1,9 @@
 // data/recorder.js — precise order recording (upserts + append-only events)
 'use strict';
 
-const db = require('./db');
-const { parseOrderFields } = require('../parser');
+const path = require('path');
+const db = require(path.join(__dirname, 'db'));
+
 
 function moneyOrNull(n) {
   if (n === null || n === undefined) return null;
