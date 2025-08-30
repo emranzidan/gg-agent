@@ -1,8 +1,4 @@
 {
-  "_meta": {
-    "version": "1.2",
-    "note": "GreenGold EMMA runtime switches. Safe to edit without touching code."
-  },
   "time": {
     "timezone": "Africa/Addis_Ababa",
     "cutoffHourLocal": 18
@@ -13,7 +9,9 @@
     "driverWindowMinutes": 30,
     "driverGiveUpMinutes": 2,
     "allowNewOrderWhileActive": true,
-    "deepLinkTtlMs": 1800000
+    "deepLinkTtlMs": 1800000,
+    "sessionTtlMinutes": 90,
+    "tinEnabled": true
   },
   "intake": {
     "strictMode": true,
@@ -29,7 +27,7 @@
     "flagForwardedReceipts": true,
     "reReviewOnUndo": true,
     "opsUnassignEnabled": false,
-    "sheetsExportEnabled": true
+    "sheetsExportEnabled": false
   },
   "ops": {
     "approveScope": "members",
@@ -38,6 +36,8 @@
   "broadcast": {
     "language": "am",
     "shortCard": true
+  },
+  "_meta": {
+    "version": "1.1"
   }
 }
-
