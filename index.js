@@ -726,44 +726,69 @@ try {
 // Ensures customer DM ("payment confirmed") is only sent AFTER the full hold window.
 // Works without changing existing approve/undo code paths.
 
-(function holdFixOverride() {
-  if (typeof finalizeApproval !== 'function') return; // safety
+// ─────────────────────────────────────────────────────────────────────────────
+// HOLD-DM INTERCEPTOR (no edits elsewhere)
+// If a message matches customer.payment_confirmed_after_hold, delay it until hold is over.
+(function deferPaymentConfirmedDM() {
+  try {
+    if (!bot?.telegram?.sendMessage) return;
+    const originalSend = bot.telegram.sendMessage.bind(bot.telegram);
 
-  const originalFinalize = finalizeApproval;
+    // build a regex from messages.json template: replace {REF} with a capture
+    function escapeReg(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+    const tpl = (typeof get === 'function' && get(MSG,'customer.payment_confirmed_after_hold')) || '';
+    let matcher = null;
 
-  finalizeApproval = async function (s, uid) {
-    try {
-      if (!s || s.status !== 'APPROVED_HOLD') return;
-
-      const neededMs = (typeof HOLD_SECONDS === 'number' && HOLD_SECONDS > 0 ? HOLD_SECONDS : 60) * 1000;
-
-      // If no hold start recorded, record + schedule; do NOT DM now
-      if (!s.holdActivatedAt) {
-        s.holdActivatedAt = Date.now();
-        if (s.approvalTimer) { try { clearTimeout(s.approvalTimer); } catch {} s.approvalTimer = null; }
-        s.approvalTimer = setTimeout(() => finalizeApproval(s, uid).catch(()=>{}), neededMs);
-        return;
-      }
-
-      // If called early, re-schedule for remaining; do NOT DM
-      const elapsed = Date.now() - s.holdActivatedAt;
-      if (elapsed < neededMs) {
-        const left = neededMs - elapsed;
-        if (s.approvalTimer) { try { clearTimeout(s.approvalTimer); } catch {} s.approvalTimer = null; }
-        s.approvalTimer = setTimeout(() => finalizeApproval(s, uid).catch(()=>{}), left);
-        return;
-      }
-
-      // Only fire once
-      if (s.confirmationSent) return;
-      s.confirmationSent = true;
-
-      // Delegate to original finalize (this sends DM + dispatch)
-      return originalFinalize.call(this, s, uid);
-    } catch (e) {
-      console.error('holdFixOverride finalizeApproval error:', e);
+    if (tpl && tpl.includes('{REF}')) {
+      const pat = '^' + escapeReg(tpl).replace('\\{REF\\}', '(?<ref>[A-Z0-9_\\-]+)') + '$';
+      matcher = new RegExp(pat);
+    } else {
+      // fallback matcher if template missing: look for a REF token like GG_XXXX
+      matcher = /(?:^|\b)REF[:\s]*?(?<ref>GG_[A-Z0-9_-]+)/i;
     }
-  };
+
+    bot.telegram.sendMessage = async function(chatId, text, extra) {
+      try {
+        const str = typeof text === 'string' ? text : '';
+        const m = matcher.exec(str);
+        const ref = m?.groups?.ref || null;
+
+        if (ref && typeof Session?.getSessionByRef === 'function') {
+          const s = Session.getSessionByRef(ref);
+
+          // only intercept the specific "payment confirmed after hold" DM during hold
+          const isHoldDM = tpl ? (str === tpl.replace('{REF}', ref)) : /payment/i.test(str) && /confirm/i.test(str);
+
+          if (isHoldDM && s && s.status === 'APPROVED_HOLD') {
+            const holdMs = (typeof HOLD_SECONDS === 'number' && HOLD_SECONDS > 0 ? HOLD_SECONDS : 60) * 1000;
+            const started = s.holdActivatedAt || Date.now();
+            s.holdActivatedAt = started;
+
+            const elapsed = Date.now() - started;
+            const delay = Math.max(0, holdMs - elapsed);
+
+            // schedule the DM for when the hold actually ends; send only once
+            setTimeout(() => {
+              try {
+                if (s.status === 'APPROVED_HOLD' && !s.confirmationSent) {
+                  s.confirmationSent = true;
+                  originalSend(chatId, text, extra).catch(()=>{});
+                }
+              } catch {}
+            }, delay);
+
+            // swallow the immediate send
+            return;
+          }
+        }
+      } catch {
+        // if anything blows up, fall through to default send
+      }
+      return originalSend(chatId, text, extra);
+    };
+  } catch (e) {
+    console.error('deferPaymentConfirmedDM init error:', e);
+  }
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────
