@@ -778,177 +778,110 @@ try {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HOLD-DM INTERCEPTOR (no edits elsewhere)
-// If a message matches customer.payment_confirmed_after_hold, delay it until hold is over.
-(function deferPaymentConfirmedDM() {
-  try {
-    if (!bot?.telegram?.sendMessage) return;
-    const originalSend = bot.telegram.sendMessage.bind(bot.telegram);
-
-    // build a regex from messages.json template: replace {REF} with a capture
-    function escapeReg(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-    const tpl = (typeof get === 'function' && get(MSG,'customer.payment_confirmed_after_hold')) || '';
-    let matcher = null;
-
-    if (tpl && tpl.includes('{REF}')) {
-      const pat = '^' + escapeReg(tpl).replace('\\{REF\\}', '(?<ref>[A-Z0-9_\\-]+)') + '$';
-      matcher = new RegExp(pat);
-    } else {
-      // fallback matcher if template missing: look for a REF token like GG_XXXX
-      matcher = /(?:^|\b)REF[:\s]*?(?<ref>GG_[A-Z0-9_-]+)/i;
-    }
-
-    bot.telegram.sendMessage = async function(chatId, text, extra) {
-      try {
-        const str = typeof text === 'string' ? text : '';
-        const m = matcher.exec(str);
-        const ref = m?.groups?.ref || null;
-
-        if (ref && typeof Session?.getSessionByRef === 'function') {
-          const s = Session.getSessionByRef(ref);
-
-          // only intercept the specific "payment confirmed after hold" DM
-          const isHoldDM = tpl ? (str === tpl.replace('{REF}', ref)) : /payment/i.test(str) && /confirm/i.test(str);
-
-          if (isHoldDM && s) {
-            const holdMs = (typeof HOLD_SECONDS === 'number' && HOLD_SECONDS > 0 ? HOLD_SECONDS : 60) * 1000;
-
-            // if staff hit Undo, status will NOT be APPROVED_HOLD/DISPATCHING → do not send
-            const okStatuses = new Set(['APPROVED_HOLD','DISPATCHING']);
-            if (!okStatuses.has(s.status)) {
-              // swallow if not in hold/dispatch (i.e., undone)
-              return;
-            }
-
-            const started = s.holdActivatedAt || Date.now();
-            s.holdActivatedAt = started;
-
-            const elapsed = Date.now() - started;
-            const delay = Math.max(0, holdMs - elapsed);
-
-            setTimeout(() => {
-              try {
-                // re-check that we didn't get undone
-                const s2 = Session.getSessionByRef(ref);
-                if (!s2) return;
-                if (!okStatuses.has(s2.status)) return; // e.g., undone back to AWAITING_RECEIPT
-
-                if (!s2.confirmationSent) {
-                  s2.confirmationSent = true;
-                  originalSend(chatId, text, extra).catch(()=>{});
-                }
-              } catch {}
-            }, delay);
-
-            // swallow the immediate send
-            return;
-          }
-        }
-      } catch {
-        // on any parsing error, just fall through
-      }
-      return originalSend(chatId, text, extra);
-    };
-  } catch (e) {
-    console.error('deferPaymentConfirmedDM init error:', e);
-  }
-})();
-// ─────────────────────────────────────────────────────────────────────────────
-// DRIVER UNDO LATE-WIRE (30s) — paste-and-go
-// Adds Undo (30s) buttons for driver actions without touching main flow.
-//
-// How it works:
-//  - Intercepts sendMessage:
-//      * When an assigned job card is DM'd to a driver (after ACCEPT), we DM an Undo (30s) button.
-//      * When staff messages announce PICKED/DELIVERED, we DM the assigned driver an Undo (30s).
-//  - Handles undo callbacks: drv_undo:<accept|picked|delivered>:<REF>
-
+// DRIVER UNDO LATE-WIRE (30s) — HOTFIX v2+ (final, single block)
+// - Only show UNDO when a driver actually ACCEPTS (s.assigned_driver_id == driverId)
+// - Only show UNDO for PICKED/DELIVERED when staff templates match strictly
+// - Deduplicate per {action, driverId, ref} and auto-expire keys
+// - After DELIVERED → UNDO, re-show driver action buttons
 try {
   const driverUndo = require('./core/driverUndo');
   const UNDO_SECS = 30;
 
+  const sentKeys = new Set();
+  const mkKey = (action, driverId, ref) => `${action}:${driverId}:${ref}`;
+  function markSent(action, driverId, ref) {
+    const key = mkKey(action, driverId, ref);
+    sentKeys.add(key);
+    setTimeout(() => sentKeys.delete(key), UNDO_SECS * 1000 + 2000);
+  }
+  function alreadySent(action, driverId, ref) {
+    return sentKeys.has(mkKey(action, driverId, ref));
+  }
+
   // helpers
   const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   function tmplMatcher(key) {
-    // Build a regex from messages.json template (if present)
     const tpl = (typeof get === 'function' && get(MSG, key)) || '';
-    if (!tpl) return null;
-    let pat = esc(tpl);
-    pat = pat.replace('\\{REF\\}', '(?<ref>GG_[A-Z0-9_\\-]+)');
-    pat = pat.replace('\\{USER_ID\\}', '(?<uid>\\d+)');
+    if (!tpl || !tpl.includes('{REF}')) return null;
+    let pat = esc(tpl).replace('\\{REF\\}', '(?<ref>GG_[A-Z0-9_\\-]+)');
+    pat = pat.replace(/\\\{[A-Z0-9_]+\\\}/g, '.*?'); // any other placeholders
     return new RegExp('^' + pat + '$', 'i');
   }
-  const rxPicked    = tmplMatcher('staff.picked_up');
-  const rxDelivered = tmplMatcher('staff.delivered');
-  // (we detect ACCEPT via the driver DM of the assigned card)
+  const rxAssigned   = tmplMatcher('driver.assigned_card_am'); // DM to driver after accept
+  const rxPicked     = tmplMatcher('staff.picked_up');
+  const rxDelivered  = tmplMatcher('staff.delivered');
 
   function extractRefLoose(str) {
     try { return (str && String(str).match(/GG_[A-Z0-9_-]+/))?.[0] || null; } catch { return null; }
   }
+
   async function sendUndoPrompt(driverId, ref, action) {
-    try {
-      driverUndo.open(ref, action, driverId, UNDO_SECS);
-      const btn = Markup.inlineKeyboard([
-        [Markup.button.callback(`↩️ Undo (${UNDO_SECS}s)`, `drv_undo:${action}:${ref}`)]
-      ]);
-      await bot.telegram.sendMessage(driverId, `Undo ${action.toUpperCase()} for ${ref}?`, btn);
-    } catch (e) { /* swallow */ }
+    if (alreadySent(action, driverId, ref)) return;
+    driverUndo.open(ref, action, driverId, UNDO_SECS);
+    markSent(action, driverId, ref);
+    const btn = Markup.inlineKeyboard([
+      [Markup.button.callback(`↩️ Undo (${UNDO_SECS}s)`, `drv_undo:${action}:${ref}`)]
+    ]);
+    await bot.telegram.sendMessage(driverId, `Undo ${action.toUpperCase()} for ${ref}?`, btn);
   }
 
-  // Wrap sendMessage to piggyback on existing flow
+  // Wrap sendMessage to piggyback on messages ALREADY being sent
   const __send = bot.telegram.sendMessage.bind(bot.telegram);
   bot.telegram.sendMessage = async function(chatId, text, extra) {
     try {
       const chatNum = Number(chatId);
       const str = typeof text === 'string' ? text : '';
 
-      // Case A: ACCEPT just happened → driver DM gets the assigned card with the REF
-      // (We identify: message to a known driver + contains a GG_ REF)
+      // ACCEPT: only when the driver actually becomes assignee and receives the "assigned" card
       if (drivers && drivers.has(chatNum)) {
         const ref = extractRefLoose(str);
-        if (ref) {
-          // Offer UNDO for ACCEPT
-          await sendUndoPrompt(chatNum, ref, 'accept');
+        if (ref && rxAssigned && rxAssigned.test(str)) {
+          const s = (typeof Session?.getSessionByRef === 'function') ? Session.getSessionByRef(ref) : null;
+          if (s && s.assigned_driver_id === chatNum && s.status === 'ASSIGNED') {
+            await sendUndoPrompt(chatNum, ref, 'accept');
+          }
         }
       }
 
-      // Case B: staff announces PICKED/DELIVERED → DM UNDO to assigned driver
+      // PICKED / DELIVERED: only when staff templates match STRICTLY
       if (STAFF_GROUP_ID && chatNum === Number(STAFF_GROUP_ID)) {
         const ref = extractRefLoose(str);
         if (ref) {
-          let action = null;
-          // Try strict template match first
-          if (rxPicked && rxPicked.test(str)) action = 'picked';
-          else if (rxDelivered && rxDelivered.test(str)) action = 'delivered';
-          else {
-            // Fallback keyword sniff (English/Amharic common)
-            if (/(picked|pick up|ቴነሳ|ተነሳ)/i.test(str)) action = 'picked';
-            else if (/(delivered|delivery complete|ተደረሰ)/i.test(str)) action = 'delivered';
-          }
-          if (action) {
-            const s = (typeof Session?.getSessionByRef === 'function') ? Session.getSessionByRef(ref) : null;
-            const driverId = s?.assigned_driver_id || null;
-            if (driverId) await sendUndoPrompt(driverId, ref, action);
+          const s = (typeof Session?.getSessionByRef === 'function') ? Session.getSessionByRef(ref) : null;
+          const driverId = s?.assigned_driver_id || null;
+          if (driverId) {
+            if (rxPicked && rxPicked.test(str)) {
+              await sendUndoPrompt(driverId, ref, 'picked');
+            } else if (rxDelivered && rxDelivered.test(str)) {
+              await sendUndoPrompt(driverId, ref, 'delivered');
+            }
           }
         }
       }
 
-    } catch (e) { /* ignore */ }
+    } catch (e) { /* swallow */ }
     return __send(chatId, text, extra);
   };
 
   // Handle UNDO button presses
   bot.action(/^drv_undo:(accept|picked|delivered):(.+)$/, async (ctx) => {
     try {
-      if (!ctx || !ctx.from) return;
       const action = ctx.match[1];
       const ref    = ctx.match[2];
       const driverId = Number(ctx.from.id);
 
       const s = (typeof Session?.getSessionByRef === 'function') ? Session.getSessionByRef(ref) : null;
       if (!s) { await ctx.answerCbQuery('Order not found or expired.'); return; }
-      if (s.assigned_driver_id && s.assigned_driver_id !== driverId && action !== 'accept') {
-        await ctx.answerCbQuery('Not your job.'); return;
+
+      // Ownership checks
+      if (action === 'accept') {
+        if (s.assigned_driver_id !== driverId || s.status !== 'ASSIGNED') {
+          await ctx.answerCbQuery('Not allowed.'); return;
+        }
+      } else {
+        if (s.assigned_driver_id !== driverId) {
+          await ctx.answerCbQuery('Not your job.'); return;
+        }
       }
 
       const res = driverUndo.consume(ref, action, driverId);
@@ -957,27 +890,21 @@ try {
         return;
       }
 
-      // Perform rollbacks
+      // Rollbacks
       if (action === 'accept') {
-        // Put job back to pool
         s.assigned_driver_id = null;
         s.status = 'DISPATCHING';
         s.giveupUntil = null;
-
         await ctx.answerCbQuery('Undone. Unassigned.');
-        try {
-          if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, `Driver UNDO: ACCEPT → ${ref}. Rebroadcasted.`);
-        } catch {}
+        try { if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, `Driver UNDO: ACCEPT → ${ref}. Rebroadcasted.`); } catch {}
         try { await broadcastToDrivers(s); } catch {}
         return;
       }
 
       if (action === 'picked') {
-        // Back to ASSIGNED with actions restored
         s.status = 'ASSIGNED';
         await ctx.answerCbQuery('Picked → undone.');
 
-        // Re-offer driver action buttons
         const btnPicked = get(MSG,'buttons.drv_picked_am') || '✔ ተነሳ';
         const btnDone   = get(MSG,'buttons.drv_done_am')   || '✔✔ ተደረሰ';
         const btnGiveup = get(MSG,'buttons.drv_giveup_am') || 'እተዋለሁ';
@@ -994,14 +921,25 @@ try {
       }
 
       if (action === 'delivered') {
-        // Back to OUT_FOR_DELIVERY
         s.status = 'OUT_FOR_DELIVERY';
         await ctx.answerCbQuery('Delivered → undone (within window).');
+
+        // Re-offer driver action buttons
+        const btnPicked = get(MSG,'buttons.drv_picked_am') || '✔ ተነሳ';
+        const btnDone   = get(MSG,'buttons.drv_done_am')   || '✔✔ ተደረሰ';
+        const btnGiveup = get(MSG,'buttons.drv_giveup_am') || 'እተዋለሁ';
+        const driverActions = Markup.inlineKeyboard([
+          [Markup.button.callback(btnPicked, `drv_picked:${ref}`)],
+          [Markup.button.callback(btnDone,   `drv_done:${ref}`)],
+          [Markup.button.callback(btnGiveup, `drv_giveup:${ref}`)]
+        ]);
         try {
+          await bot.telegram.sendMessage(driverId, `Actions restored for ${ref}.`, driverActions);
           if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, `Driver UNDO: DELIVERED → ${ref}. Back to OUT_FOR_DELIVERY.`);
         } catch {}
         return;
       }
+
     } catch (e) {
       console.error('drv_undo handler error', e);
       try { await ctx.answerCbQuery('Undo error.'); } catch {}
@@ -1009,7 +947,7 @@ try {
   });
 
 } catch (e) {
-  console.error('Driver UNDO late-wire init error:', e);
+  console.error('Driver UNDO HOTFIX init error:', e);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
