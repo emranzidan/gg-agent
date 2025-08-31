@@ -14,8 +14,13 @@
     "tin_yes": "Yes, I have TIN",
     "tin_no": "No",
     "clear_prev_yes": "Clear previous",
-    "clear_prev_no": "Keep & continue"
+    "clear_prev_no": "Keep & continue",
+
+    /* labels for optional tap-to-copy buttons (code change needed to use) */
+    "copy_merchant_id": "Copy Merchant ID",
+    "copy_cbe_account": "Copy Account Number"
   },
+
   "customer": {
     "welcome": "🧾 Order received (Ref {REF}). Choose a payment method:",
     "welcome_after_cutoff": "🧾 Order received (Ref {REF}). Heads up: we are past the delivery cutoff; dispatch may start next day. Choose a payment method:",
@@ -26,9 +31,9 @@
     "existing_awaiting_payment_nudge": "You’re still on order {REF}. Choose a payment method or send your receipt.",
     "awaiting_receipt_text": "Please send a clear screenshot/photo of your payment receipt.",
 
-    "payment_info_telebirr": "📱 Telebirr\nMerchant: Green Gold Ethiopia plc\n\nMerchant ID: +86555\n\nAmount: ETB {TOTAL}\n\nPhone: +251 904 122 222\n\n(Pay for Merchant → enter Merchant ID → enter Amount)\n\nAfter payment, please upload your receipt screenshot here.",
+    "payment_info_telebirr": "📱 Telebirr\nMerchant: Green Gold Ethiopia plc\n\nMerchant ID: 86555\n\nAmount: ETB {TOTAL}\n\nPhone: +251 904 122 222\n\nGuide: “Pay for Merchant → enter Merchant ID → enter Amount”.\n\nAfter payment, please upload your receipt screenshot here.",
 
-    "payment_info_cbe": "🏦 Commercial Bank of Ethiopia (CBE)\nAccount Name: Green Gold Ethiopia\n\nAccount Number: +1000387118806\n\nBranch: Bambis Branch\n\nAmount to pay: ETB {TOTAL}\n\nAfter transfer, please upload your receipt screenshot here.",
+    "payment_info_cbe": "🏦 Commercial Bank of Ethiopia (CBE)\nAccount Name: Green Gold Ethiopia\n\nAccount Number: 1000387118806\n\nBranch: Bambis Branch\n\nAmount to pay: ETB {TOTAL}\n\nAfter transfer, please upload your receipt screenshot here.",
 
     "receipt_received": "👍 Receipt received for {REF}. We’ll review and confirm shortly.",
     "payment_rejected": "❌ Payment for {REF} was not approved. Please resend a clear screenshot or contact support at {SUPPORT_PHONE}.",
@@ -48,11 +53,13 @@
     "tin_retry": "That doesn’t look like a TIN. Please send your TIN number.",
     "tin_saved": "TIN saved. Posting your receipt for review..."
   },
+
   "support": {
     "escalation_post": "🆘 Support Request\n👤 {CUSTOMER_NAME} ({USERNAME})\n🆔 {USER_ID}\n\nMessage:\n{MESSAGE}",
     "customer_claim_dm": "Our support specialist is on it. You can also reach us at {SUPPORT_PHONE}.",
     "claimed_suffix": "\n— Claimed by {CLAIMER_NAME}"
   },
+
   "staff": {
     "method_selected": "💳 Method selected for {REF}: {METHOD}\n👤 {CUSTOMER_NAME} ({USERNAME})",
     "receipt_caption": "🧾 Receipt for {REF}\nMethod: {METHOD}\n👤 {CUSTOMER_NAME} ({USERNAME})\n🆔 {USER_ID}",
@@ -77,6 +84,7 @@
     "broadcast_failed_hint": "⚠️ Couldn’t DM {COUNT} driver(s). They may have blocked the bot.",
     "superseded_notice": "❗ Order {OLD_REF} canceled/superseded. New order pending ({NEW_REF})."
   },
+
   "driver": {
     "broadcast_card_am": "🧾 ትዕዛዝ {REF}\n• እቃ ብዛት: {QTY}\n• አካባቢ: {AREA}\n• ጠቅላላ ዋጋ: ETB {TOTAL}\n• ማጓጓዣ ክፍያ: ETB {DELIVERY_FEE}\n{MAP_LINE}",
     "broadcast_map_line_am": "📍 Map: {MAP_URL}",
@@ -90,6 +98,7 @@
     "giveup_ok": "You’ve given up this job.",
     "giveup_too_late": "Too late to give up this job."
   },
+
   "errors": {
     "no_pending_new_order": "No new order found — please paste your new order again."
   }
