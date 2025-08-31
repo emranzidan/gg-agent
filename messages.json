@@ -26,9 +26,9 @@
     "existing_awaiting_payment_nudge": "You’re still on order {REF}. Choose a payment method or send your receipt.",
     "awaiting_receipt_text": "Please send a clear screenshot/photo of your payment receipt.",
 
-    "payment_info_telebirr": "📱 Telebirr\nMerchant: Green Gold Ethiopia plc\n\nMerchant ID: <u>86555</u>\n\nPhone: +251 904 122 222\n\nAmount: ETB {TOTAL}\n\nAfter payment, please upload your receipt screenshot here.",
+    "payment_info_telebirr": "📱 Telebirr\nMerchant: Green Gold Ethiopia plc\n\nMerchant ID: +86555\n\nAmount: ETB {TOTAL}\n\nPhone: +251 904 122 222\n\n(Pay for Merchant → enter Merchant ID → enter Amount)\n\nAfter payment, please upload your receipt screenshot here.",
 
-    "payment_info_cbe": "🏦 Commercial Bank of Ethiopia (CBE)\nAccount Name: Green Gold Ethiopia\n\nAccount Number: <u>1000387118806</u>\n\nBranch: Bambis Branc\n\nAmount to pay: ETB {TOTAL}\n\nAfter transfer, please upload your receipt screenshot here.",
+    "payment_info_cbe": "🏦 Commercial Bank of Ethiopia (CBE)\nAccount Name: Green Gold Ethiopia\n\nAccount Number: +1000387118806\n\nBranch: Bambis Branch\n\nAmount to pay: ETB {TOTAL}\n\nAfter transfer, please upload your receipt screenshot here.",
 
     "receipt_received": "👍 Receipt received for {REF}. We’ll review and confirm shortly.",
     "payment_rejected": "❌ Payment for {REF} was not approved. Please resend a clear screenshot or contact support at {SUPPORT_PHONE}.",
@@ -94,4 +94,3 @@
     "no_pending_new_order": "No new order found — please paste your new order again."
   }
 }
-
