@@ -233,7 +233,185 @@ async function postSheets(event, data = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-/** Health & basics **/
+// SILENT WINDOWS (driver 15s) — schedule external effects after UNDO window
+const UNDO_SECS = 15;
+const openUndos = new Map();     // key = `${ref}:${action}:${driverId}` -> expiresAt (ms)
+const pendingFx = new Map();     // key -> timeout handle
+
+const fxKey = (ref, action, driverId) => `${ref}:${action}:${driverId}`;
+function cancelFx(ref, action, driverId) {
+  const key = fxKey(ref, action, driverId);
+  const h = pendingFx.get(key);
+  if (h) { clearTimeout(h); pendingFx.delete(key); }
+}
+function scheduleFx(ref, action, driverId, fn) {
+  cancelFx(ref, action, driverId);
+  const key = fxKey(ref, action, driverId);
+  const h = setTimeout(async () => {
+    pendingFx.delete(key);
+    try { await fn(); } catch (e) { /* swallow */ }
+  }, UNDO_SECS * 1000);
+  pendingFx.set(key, h);
+}
+
+function isUndoOpen(ref, action, driverId) {
+  const exp = openUndos.get(fxKey(ref, action, driverId));
+  return !!exp && Date.now() <= exp;
+}
+async function openUndoPrompt(ref, action, driverId, labelText) {
+  const expiresAt = Date.now() + UNDO_SECS * 1000;
+  openUndos.set(fxKey(ref, action, driverId), expiresAt);
+  setTimeout(() => openUndos.delete(fxKey(ref, action, driverId)), UNDO_SECS * 1000 + 500);
+
+  const btn = Markup.inlineKeyboard([
+    [Markup.button.callback(`↩️ Undo (${UNDO_SECS}s)`, `drv_undo_simple:${action}:${ref}`)]
+  ]);
+  try { await bot.telegram.sendMessage(driverId, `Undo ${labelText} — ${ref}?`, btn); } catch {}
+}
+function driverActionsKB(ref) {
+  const btnPicked = get(MSG,'buttons.drv_picked_am') || '✔ ተነሳ';
+  const btnDone   = get(MSG,'buttons.drv_done_am')   || '✔✔ ተደረሰ';
+  const btnGiveup = get(MSG,'buttons.drv_giveup_am') || 'እተዋለሁ';
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(btnPicked, `drv_picked:${ref}`)],
+    [Markup.button.callback(btnDone,   `drv_done:${ref}`)],
+    [Markup.button.callback(btnGiveup, `drv_giveup:${ref}`)]
+  ]);
+}
+async function showDriverActions(ref, driverId) {
+  try { await bot.telegram.sendMessage(driverId, `Actions restored for ${ref}.`, driverActionsKB(ref)); } catch {}
+}
+async function showAcceptDeclineToDriver(s, driverId) {
+  try {
+    const btnAccept = get(MSG,'buttons.drv_accept_am') || '✅ ተቀበል';
+    const btnDecline= get(MSG,'buttons.drv_decline_am')|| '❌ አትቀበል';
+    const kb = Markup.inlineKeyboard([[Markup.button.callback(btnAccept, `drv_accept:${s.ref}`),
+                                       Markup.button.callback(btnDecline, `drv_decline:${s.ref}`)]]);
+    const f = parseOrderFields(s.summary || '');
+    const mapLine = f.map && f.map !== '—' ? t('driver.broadcast_map_line_am', { MAP_URL: f.map }) : '';
+    let card = t('driver.broadcast_card_am', {
+      REF: s.ref, QTY: f.qty, AREA: f.area, TOTAL: f.total, DELIVERY_FEE: f.delivery, MAP_LINE: mapLine
+    });
+    if (f.customerName) card = `👤 ${f.customerName}\n` + card;
+    if (f.phone) card += `\n📞 ${f.phone}`;
+    await bot.telegram.sendMessage(driverId, card, kb);
+  } catch {}
+}
+
+// Accept → external effects (after 15s if not undone)
+function scheduleAcceptEffects(ref, driverId) {
+  scheduleFx(ref, 'accept', driverId, async () => {
+    const s = Session.getSessionByRef(ref);
+    if (!s) return;
+    if (s.assigned_driver_id !== driverId || s.status !== 'ASSIGNED') return;
+
+    const d = drivers.get(driverId);
+    if (STAFF_GROUP_ID) {
+      await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_accepted', {
+        REF: ref, DRIVER_NAME: d ? d.name : `id ${driverId}`, DRIVER_PHONE: d ? d.phone : '—', USER_ID: d ? d.id : driverId
+      })).catch(()=>{});
+    }
+    const f = parseOrderFields(s.summary || '');
+    if (s._customerId) {
+      await bot.telegram.sendMessage(s._customerId, t('customer.driver_assigned', {
+        REF: ref, DRIVER_NAME: d ? d.name : 'Assigned driver', DRIVER_PHONE: d ? d.phone : '—'
+      })).catch(()=>{});
+    }
+    await postSheets('assigned', {
+      ref,
+      customer_name: f.customerName || '',
+      phone: f.phone || '',
+      area: f.area || '',
+      map_url: f.map || '',
+      total_etb: f.total || '',
+      delivery_fee: f.delivery || '',
+      payment_method: s.method || '',
+      driver_id: d ? d.id : driverId,
+      driver_name: d ? d.name : '',
+      driver_phone: d ? d.phone : '',
+      status: 'ASSIGNED'
+    });
+  });
+}
+
+// Picked → external effects
+function schedulePickedEffects(ref, driverId) {
+  scheduleFx(ref, 'picked', driverId, async () => {
+    const s = Session.getSessionByRef(ref);
+    if (!s) return;
+    if (s.assigned_driver_id !== driverId || s.status !== 'OUT_FOR_DELIVERY') return;
+
+    if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.picked_up', { REF: ref, USER_ID: driverId })).catch(()=>{});
+    if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.picked_up', { REF: ref })).catch(()=>{});
+  });
+}
+
+// Delivered → external effects (incl. persist)
+function scheduleDeliveredEffects(ref, driverId) {
+  scheduleFx(ref, 'delivered', driverId, async () => {
+    const s = Session.getSessionByRef(ref);
+    if (!s) return;
+    if (s.assigned_driver_id !== driverId || s.status !== 'DELIVERED') return;
+
+    if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.delivered', { REF: ref, USER_ID: driverId })).catch(()=>{});
+    if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.delivered', { REF: ref })).catch(()=>{});
+
+    const f3 = parseOrderFields(s.summary || '');
+    const dInfo2 = drivers.get(driverId);
+    await postSheets('delivered', {
+      ref,
+      customer_name: f3.customerName || '',
+      phone: f3.phone || '',
+      area: f3.area || '',
+      map_url: f3.map || '',
+      total_etb: f3.total || '',
+      delivery_fee: f3.delivery || '',
+      payment_method: s.method || '',
+      driver_id: dInfo2 ? dInfo2.id : driverId,
+      driver_name: dInfo2 ? dInfo2.name : '',
+      driver_phone: dInfo2 ? dInfo2.phone : '',
+      status: 'DELIVERED'
+    });
+    // Persist to Supabase
+    try {
+      const orderObj = {
+        order_id: s.ref,
+        customer_name:  f3.customerName || null,
+        email:          null,
+        phone:          f3.phone || null,
+        payment_status: 'approved',
+        driver_name:    (dInfo2 ? dInfo2.name : 'Driver'),
+        delivery_location: f3.area || null,
+        product_price:  Number(String(f3.total||'').replace(/[^\d.]/g,'')) || null,
+        delivery_price: Number(String(f3.delivery||'').replace(/[^\d.]/g,'')) || null,
+        type_chosen:    f3.type  || null,
+        roast_level:    f3.roast || null,
+        size:           f3.size  || null,
+        qty:            f3.qty   || null
+      };
+      await persist(orderObj, 'delivered', { tz: TIMEZONE });
+    } catch (e) {
+      console.error('persist(delivered) error', e);
+      if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${ref} (delivered)`).catch(()=>{});
+    }
+  });
+}
+
+// Give up → external effects (rebroadcast)
+function scheduleGiveupEffects(ref, driverId) {
+  scheduleFx(ref, 'giveup', driverId, async () => {
+    const s = Session.getSessionByRef(ref);
+    if (!s) return;
+    if (s.status !== 'DISPATCHING' || s.assigned_driver_id) return;
+
+    if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_canceled_rebroadcast', { REF: ref, USER_ID: driverId })).catch(()=>{});
+    await broadcastToDrivers(s, driverId);
+    setDriverTimer(ref);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Health & basics
 bot.start(async (ctx) => {
   const txt = ctx.message?.text || '';
   const payload = txt.split(' ')[1];
@@ -456,7 +634,6 @@ bot.on('callback_query', async (ctx, next) => {
         await ctx.telegram.sendMessage(STAFF_GROUP_ID, t('staff.action_expired', { REF: ref }));
         return;
       }
-      // remember customer id on session so timers can DM later
       if (uid && !s._customerId) s._customerId = uid;
 
       if (verb === 'approve') {
@@ -473,10 +650,7 @@ bot.on('callback_query', async (ctx, next) => {
           if (!fresh || fresh.status !== 'APPROVED_HOLD') return;
           await finalizeApproval(fresh).catch(()=>{});
         }, HOLD_SECONDS * 1000);
-        // DM customer that payment confirmed & dispatching soon (after hold completes)
-        if (s._customerId) {
-          await bot.telegram.sendMessage(s._customerId, t('customer.payment_confirmed_after_hold', { REF: s.ref })).catch(()=>{});
-        }
+        // 🔇 NO customer DM here — sent only after hold in finalizeApproval()
         return ctx.answerCbQuery('Approved (on hold).');
       } else {
         s.status = 'REJECTED';
@@ -522,45 +696,14 @@ bot.on('callback_query', async (ctx, next) => {
         let assignedCard = t('driver.assigned_card_am', {
           REF: s.ref, QTY: f.qty, AREA: f.area, TOTAL: f.total, DELIVERY_FEE: f.delivery, MAP_LINE: mapLine
         });
-        // ➕ include customer phone
         if (f.phone) assignedCard += `\n📞 ${f.phone}`;
 
         await ctx.reply(assignedCard, driverActions);
         await ctx.answerCbQuery('Assigned to you.');
 
-        // OPEN UNDO (15s) for ACCEPT
-        if (typeof global.tryOpenUndo === 'function') {
-          await global.tryOpenUndo('accept', s.ref, ctx.from.id);
-        }
-
-        const d = drivers.get(ctx.from.id);
-        if (STAFF_GROUP_ID) {
-          await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_accepted', {
-            REF: s.ref, DRIVER_NAME: d ? d.name : `id ${ctx.from.id}`, DRIVER_PHONE: d ? d.phone : '—', USER_ID: d ? d.id : ctx.from.id
-          }));
-        }
-        // DM customer that a driver is assigned
-        if (s._customerId) {
-          await bot.telegram.sendMessage(s._customerId, t('customer.driver_assigned', {
-            REF: s.ref, DRIVER_NAME: d ? d.name : 'Assigned driver', DRIVER_PHONE: d ? d.phone : '—'
-          })).catch(()=>{});
-        }
-
-        // Sheets: assigned
-        await postSheets('assigned', {
-          ref: s.ref,
-          customer_name: f.customerName || '',
-          phone: f.phone || '',
-          area: f.area || '',
-          map_url: f.map || '',
-          total_etb: f.total || '',
-          delivery_fee: f.delivery || '',
-          payment_method: s.method || '',
-          driver_id: d ? d.id : ctx.from.id,
-          driver_name: d ? d.name : '',
-          driver_phone: d ? d.phone : '',
-          status: 'ASSIGNED'
-        });
+        // 🔇 Silent window: only show UNDO to driver + schedule effects
+        await openUndoPrompt(s.ref, 'accept', ctx.from.id, 'ተቀበል');
+        scheduleAcceptEffects(s.ref, ctx.from.id);
         return;
       } else {
         return ctx.answerCbQuery(get(MSG,'driver.declined_ok') || 'Declined. Thanks.');
@@ -579,80 +722,77 @@ bot.on('callback_query', async (ctx, next) => {
         if (!s.giveupUntil || Date.now() > s.giveupUntil) return ctx.answerCbQuery(get(MSG,'driver.giveup_too_late') || 'Too late.');
         const quitterId = s.assigned_driver_id;
         s.assigned_driver_id = null; s.status = 'DISPATCHING'; s.giveupUntil = null;
-        if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_canceled_rebroadcast', { REF: s.ref, USER_ID: quitterId }));
         await ctx.answerCbQuery(get(MSG,'driver.giveup_ok') || 'Given up.');
-        await broadcastToDrivers(s, quitterId);
-        setDriverTimer(s.ref);
-
-        // OPEN UNDO (15s) for GIVEUP (lets same driver reclaim)
-        if (typeof global.tryOpenUndo === 'function') {
-          await global.tryOpenUndo('giveup', s.ref, quitterId);
-        }
+        // 🔇 Silent window: undo + schedule rebroadcast (no immediate staff/broadcast)
+        await openUndoPrompt(s.ref, 'giveup', ctx.from.id, 'እተዋለሁ');
+        scheduleGiveupEffects(s.ref, quitterId);
         return;
       }
 
       if (data.startsWith('drv_picked:')) {
         s.status = 'OUT_FOR_DELIVERY';
         await ctx.answerCbQuery(get(MSG,'driver.picked_marked') || 'Picked.');
-        if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.picked_up', { REF: s.ref, USER_ID: ctx.from.id }));
-        if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.picked_up', { REF: s.ref })).catch(()=>{});
-
-        // OPEN UNDO (15s) for PICKED
-        if (typeof global.tryOpenUndo === 'function') {
-          await global.tryOpenUndo('picked', s.ref, ctx.from.id);
-        }
+        // 🔇 Silent window: undo + schedule staff/customer notices
+        await openUndoPrompt(s.ref, 'picked', ctx.from.id, 'ተነሳ');
+        schedulePickedEffects(s.ref, ctx.from.id);
         return;
       } else {
         s.status = 'DELIVERED';
         await ctx.answerCbQuery(get(MSG,'driver.delivered_marked') || 'Delivered.');
-        if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.delivered', { REF: s.ref, USER_ID: ctx.from.id }));
-        if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.delivered', { REF: s.ref })).catch(()=>{});
+        // 🔇 Silent window: undo + schedule staff/customer + sheets + persist
+        await openUndoPrompt(s.ref, 'delivered', ctx.from.id, 'ተደረሰ');
+        scheduleDeliveredEffects(s.ref, ctx.from.id);
+        return;
+      }
+    }
 
-        // Sheets: delivered
-        const f3 = parseOrderFields(s.summary || '');
-        const dInfo2 = drivers.get(ctx.from.id);
-        await postSheets('delivered', {
-          ref: s.ref,
-          customer_name: f3.customerName || '',
-          phone: f3.phone || '',
-          area: f3.area || '',
-          map_url: f3.map || '',
-          total_etb: f3.total || '',
-          delivery_fee: f3.delivery || '',
-          payment_method: s.method || '',
-          driver_id: dInfo2 ? dInfo2.id : ctx.from.id,
-          driver_name: dInfo2 ? dInfo2.name : '',
-          driver_phone: dInfo2 ? dInfo2.phone : '',
-          status: 'DELIVERED'
-        });
+    // UNDO button for driver actions (15s window)
+    if (/^drv_undo_simple:(accept|picked|delivered|giveup):/.test(data)) {
+      const [, action, ref] = data.match(/^drv_undo_simple:(accept|picked|delivered|giveup):(.+)$/);
+      const driverId = Number(ctx.from.id);
 
-        // EMMA2: persist delivered → Supabase
-        try {
-          const orderObj = {
-            order_id: s.ref,
-            customer_name:  f3.customerName || null,
-            email:          null,
-            phone:          f3.phone || null,
-            payment_status: 'approved',
-            driver_name:    (dInfo2 ? dInfo2.name : 'Driver'),
-            delivery_location: f3.area || null,
-            product_price:  Number(String(f3.total||'').replace(/[^\d.]/g,'')) || null,
-            delivery_price: Number(String(f3.delivery||'').replace(/[^\d.]/g,'')) || null,
-            type_chosen:    f3.type  || null,
-            roast_level:    f3.roast || null,
-            size:           f3.size  || null,
-            qty:            f3.qty   || null
-          };
-          await persist(orderObj, 'delivered', { tz: TIMEZONE });
-        } catch (e) {
-          console.error('persist(delivered) error', e);
-          if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${s.ref} (delivered)`).catch(()=>{});
-        }
+      if (!isUndoOpen(ref, action, driverId)) {
+        await ctx.answerCbQuery('Undo window expired.');
+        return;
+      }
+      cancelFx(ref, action, driverId); // cancel pending external effects
 
-        // OPEN UNDO (15s) for DELIVERED
-        if (typeof global.tryOpenUndo === 'function') {
-          await global.tryOpenUndo('delivered', s.ref, ctx.from.id);
-        }
+      const s = Session.getSessionByRef(ref);
+      if (!s) { await ctx.answerCbQuery('Order not found.'); return; }
+
+      if (action === 'accept') {
+        if (s.assigned_driver_id !== driverId || s.status !== 'ASSIGNED') { await ctx.answerCbQuery('Nothing to undo.'); return; }
+        s.assigned_driver_id = null;
+        s.status = 'DISPATCHING';
+        s.giveupUntil = null;
+        await ctx.answerCbQuery('Undone. Choose again.');
+        await showAcceptDeclineToDriver(s, driverId);
+        return;
+      }
+
+      if (action === 'picked') {
+        if (s.status !== 'OUT_FOR_DELIVERY') { await ctx.answerCbQuery('Nothing to undo.'); return; }
+        s.status = 'ASSIGNED';
+        await ctx.answerCbQuery('Picked → undone.');
+        await showDriverActions(ref, driverId);
+        return;
+      }
+
+      if (action === 'delivered') {
+        if (s.status !== 'DELIVERED') { await ctx.answerCbQuery('Nothing to undo.'); return; }
+        s.status = 'OUT_FOR_DELIVERY';
+        await ctx.answerCbQuery('Delivered → undone.');
+        await showDriverActions(ref, driverId);
+        return;
+      }
+
+      if (action === 'giveup') {
+        if (s.status !== 'DISPATCHING' || s.assigned_driver_id) { await ctx.answerCbQuery('Nothing to undo.'); return; }
+        s.assigned_driver_id = driverId;
+        s.status = 'ASSIGNED';
+        s.giveupUntil = Date.now() + (typeof GIVEUP_MS === 'number' ? GIVEUP_MS : 120000);
+        await ctx.answerCbQuery('Give up → undone.');
+        await showDriverActions(ref, driverId);
         return;
       }
     }
@@ -673,7 +813,12 @@ async function finalizeApproval(s) {
     if (s.holdMsgId) {
       await bot.telegram.editMessageText(STAFF_GROUP_ID, s.holdMsgId, undefined, t('staff.finalize_approved', { REF: s.ref })).catch(()=>{});
     }
-    // Customer DM was already sent on approve; we proceed to dispatch
+
+    // ✅ Customer DM only NOW (after full hold)
+    if (s._customerId) {
+      await bot.telegram.sendMessage(s._customerId, t('customer.payment_confirmed_after_hold', { REF: s.ref })).catch(()=>{});
+    }
+
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.dispatching_notice', { REF: s.ref }));
 
     // Sheets: approved
@@ -742,9 +887,7 @@ async function broadcastToDrivers(s, excludeId = null) {
     REF: s.ref, QTY: f.qty, AREA: f.area, TOTAL: f.total, DELIVERY_FEE: f.delivery, MAP_LINE: mapLine
   });
 
-  // Prepend customer name if present
   if (f.customerName) card = `👤 ${f.customerName}\n` + card;
-  // ➕ include customer phone
   if (f.phone) card += `\n📞 ${f.phone}`;
 
   const failed = [];
@@ -798,156 +941,7 @@ try {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DRIVER UNDO SIMPLE (15s) — accept/picked/delivered/giveup
-// - Any tap shows Undo(15s). Undo restores the same buttons.
-// - Accept→Undo: unassign and DM the accept/decline keyboard (no rebroadcast).
-try {
-  const UNDO_SECS = 15;
-  const openUndos = new Map(); // key = `${ref}:${action}:${driverId}` -> expiresAt (ms)
-
-  const LABELS = { accept: 'ተቀበል', picked: 'ተነሳ', delivered: 'ተደረሰ', giveup: 'እተዋለሁ' };
-  const k = (ref, action, driverId) => `${ref}:${action}:${driverId}`;
-
-  async function tryOpenUndo(action, ref, driverId) {
-    const expiresAt = Date.now() + UNDO_SECS * 1000;
-    openUndos.set(k(ref, action, driverId), expiresAt);
-    setTimeout(() => openUndos.delete(k(ref, action, driverId)), UNDO_SECS * 1000 + 500);
-
-    const btn = Markup.inlineKeyboard([
-      [Markup.button.callback(`↩️ Undo (${UNDO_SECS}s)`, `drv_undo_simple:${action}:${ref}`)]
-    ]);
-    const what = LABELS[action] || action.toUpperCase();
-    try { await bot.telegram.sendMessage(driverId, `Undo ${what} — ${ref}?`, btn); } catch {}
-  }
-
-  function isOpen(action, ref, driverId) {
-    const exp = openUndos.get(k(ref, action, driverId));
-    return !!exp && Date.now() <= exp;
-  }
-  function closeUndo(action, ref, driverId) {
-    openUndos.delete(k(ref, action, driverId));
-  }
-
-  // Re-show three driver action buttons
-  function buildDriverActions(ref) {
-    const btnPicked = get(MSG,'buttons.drv_picked_am') || '✔ ተነሳ';
-    const btnDone   = get(MSG,'buttons.drv_done_am')   || '✔✔ ተደረሰ';
-    const btnGiveup = get(MSG,'buttons.drv_giveup_am') || 'እተዋለሁ';
-    return Markup.inlineKeyboard([
-      [Markup.button.callback(btnPicked, `drv_picked:${ref}`)],
-      [Markup.button.callback(btnDone,   `drv_done:${ref}`)],
-      [Markup.button.callback(btnGiveup, `drv_giveup:${ref}`)]
-    ]);
-  }
-  async function showDriverActions(ref, driverId) {
-    try { await bot.telegram.sendMessage(driverId, `Actions restored for ${ref}.`, buildDriverActions(ref)); } catch {}
-  }
-
-  // Re-show accept/decline just to THIS driver (no rebroadcast)
-  async function showAcceptDeclineToDriver(s, driverId) {
-    try {
-      const btnAccept = get(MSG,'buttons.drv_accept_am') || '✅ ተቀበል';
-      const btnDecline= get(MSG,'buttons.drv_decline_am')|| '❌ አትቀበል';
-      const kb = Markup.inlineKeyboard([[Markup.button.callback(btnAccept, `drv_accept:${s.ref}`),
-                                         Markup.button.callback(btnDecline, `drv_decline:${s.ref}`)]]);
-      const f = parseOrderFields(s.summary || '');
-      const mapLine = f.map && f.map !== '—' ? t('driver.broadcast_map_line_am', { MAP_URL: f.map }) : '';
-      let card = t('driver.broadcast_card_am', {
-        REF: s.ref, QTY: f.qty, AREA: f.area, TOTAL: f.total, DELIVERY_FEE: f.delivery, MAP_LINE: mapLine
-      });
-      if (f.customerName) card = `👤 ${f.customerName}\n` + card;
-      if (f.phone) card += `\n📞 ${f.phone}`;
-      await bot.telegram.sendMessage(driverId, card, kb);
-    } catch {}
-  }
-
-  // Undo button handler
-  bot.action(/^drv_undo_simple:(accept|picked|delivered|giveup):(.+)$/, async (ctx) => {
-    try {
-      const action   = ctx.match[1];
-      const ref      = ctx.match[2];
-      const driverId = Number(ctx.from.id);
-
-      // window check
-      if (!isOpen(action, ref, driverId)) {
-        await ctx.answerCbQuery('Undo window expired.');
-        return;
-      }
-
-      const s = (typeof Session?.getSessionByRef === 'function') ? Session.getSessionByRef(ref) : null;
-      if (!s) { await ctx.answerCbQuery('Order not found.'); return; }
-
-      // Ownership sanity
-      if (action !== 'accept' && s.assigned_driver_id !== driverId) {
-        await ctx.answerCbQuery('Not your job.'); return;
-      }
-
-      // Rollbacks
-      if (action === 'accept') {
-        // Unassign & go back to pre-accept state
-        if (s.assigned_driver_id !== driverId || s.status !== 'ASSIGNED') {
-          await ctx.answerCbQuery('Nothing to undo.'); return;
-        }
-        s.assigned_driver_id = null;
-        s.status = 'DISPATCHING';
-        s.giveupUntil = null;
-        await ctx.answerCbQuery('Undone. Choose again.');
-        await showAcceptDeclineToDriver(s, driverId);
-        try { if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, `Driver UNDO(ACCEPT): ${ref} — back to DISPATCHING.`); } catch {}
-        closeUndo(action, ref, driverId);
-        return;
-      }
-
-      if (action === 'picked') {
-        if (s.status !== 'OUT_FOR_DELIVERY') { await ctx.answerCbQuery('Nothing to undo.'); return; }
-        s.status = 'ASSIGNED';
-        await ctx.answerCbQuery('Picked → undone.');
-        await showDriverActions(ref, driverId);
-        try { if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, `Driver UNDO(PICKED): ${ref} — back to ASSIGNED.`); } catch {}
-        closeUndo(action, ref, driverId);
-        return;
-      }
-
-      if (action === 'delivered') {
-        if (s.status !== 'DELIVERED') { await ctx.answerCbQuery('Nothing to undo.'); return; }
-        s.status = 'OUT_FOR_DELIVERY';
-        await ctx.answerCbQuery('Delivered → undone.');
-        await showDriverActions(ref, driverId);
-        try { if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, `Driver UNDO(DELIVERED): ${ref} — back to OUT_FOR_DELIVERY.`); } catch {}
-        closeUndo(action, ref, driverId);
-        return;
-      }
-
-      if (action === 'giveup') {
-        // Reclaim the job for same driver if still in DISPATCHING & unassigned
-        if (s.status !== 'DISPATCHING' || s.assigned_driver_id) { await ctx.answerCbQuery('Nothing to undo.'); return; }
-        s.assigned_driver_id = driverId;
-        s.status = 'ASSIGNED';
-        s.giveupUntil = Date.now() + (typeof GIVEUP_MS === 'number' ? GIVEUP_MS : 120000);
-        await ctx.answerCbQuery('Give up → undone.');
-        await showDriverActions(ref, driverId);
-        try { if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, `Driver UNDO(GIVEUP): ${ref} — reassigned to same driver.`); } catch {}
-        closeUndo(action, ref, driverId);
-        return;
-      }
-
-    } catch (e) {
-      console.error('drv_undo_simple error', e);
-      try { await ctx.answerCbQuery('Undo error.'); } catch {}
-    }
-  });
-
-  // Expose the opener to the rest of file (used by one-liners above)
-  global.tryOpenUndo = tryOpenUndo;
-
-} catch (e) {
-  console.error('UNDO SIMPLE init error', e);
-}
-// ─────────────────────────────────────────────────────────────────────────────
 bot.launch().then(() => console.log('Polling started…'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
 // ─────────────────────────────────────────────────────────────────────────────
-// HOLD-FIX OVERRIDE (paste-and-go)
-// Ensures customer DM ("payment confirmed") is only sent AFTER the full hold window.
-// Works without changing the existing approve/undo code paths.
