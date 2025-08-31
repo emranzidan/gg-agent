@@ -1,3 +1,6 @@
+
+
+
 // index.js — GreenGold EMMA (God Mode, modular, Sheets-ready)
 // Stable entrypoint. Conversations are handled in ./flows/customerBotFlow.js
 // State & refs live in ./core/session.js. Parsing in ./parser.js
@@ -16,18 +19,6 @@ const {
   parseOrderFields,
   extractRef
 } = require('./parser');
-
-/* === DATA LAYER ADDITIONS: safe optional imports & env ===================== */
-let DataEvents = null; // { recordNewOrder, markPaid, markRejected, assignDriver, markPicked, markDelivered, exportCSV }
-try {
-  DataEvents = require('./data_layer/events');
-  console.log('[data_layer] events.js loaded.');
-} catch (e) {
-  console.warn('[data_layer] events.js not found yet. Logging will be no-op until added.');
-}
-const OPS_TOKEN     = process.env.OPS_TOKEN || '';        // protects /ops/export.csv
-const APP_BASE_URL  = process.env.APP_BASE_URL || '';     // optional, for future links
-/* ========================================================================== */
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Paths
@@ -482,62 +473,12 @@ bot.on('callback_query', async (ctx, next) => {
         if (s._customerId) {
           await bot.telegram.sendMessage(s._customerId, t('customer.payment_confirmed_after_hold', { REF: s.ref })).catch(()=>{});
         }
-
-        /* === DATA LAYER ADD: markPaid (accepted) =========================== */
-        try {
-          if (DataEvents && typeof DataEvents.markPaid === 'function') {
-            const fPaid = parseOrderFields(s.summary || '');
-            await DataEvents.markPaid({
-              order_id: s.ref,
-              date: new Date().toISOString().slice(0,10),
-              time_ordered: new Date().toISOString().slice(11,19),
-              customer_name: fPaid.customerName || '',
-              email: fPaid.email || '',
-              phone: fPaid.phone || '',
-              payment_status: 'accepted',
-              delivery_location: fPaid.area || '',
-              product_price: fPaid.total || '',
-              delivery_price: fPaid.delivery || '',
-              type_chosen: fPaid.type || '',
-              roast_level: fPaid.roast || '',
-              size: fPaid.size || '',
-              qty: fPaid.qty || ''
-            });
-          }
-        } catch (e) { console.warn('[data_layer] markPaid failed (non-fatal):', e?.message); }
-        /* ================================================================== */
-
         return ctx.answerCbQuery('Approved (on hold).');
       } else {
         s.status = 'REJECTED';
         if (uid) await ctx.telegram.sendMessage(uid, t('customer.payment_rejected', { REF: s.ref, SUPPORT_PHONE })).catch(()=>{});
         await ctx.editMessageCaption({ caption: t('staff.rejected_caption', { REF: s.ref }) }).catch(()=>{});
         await ctx.telegram.sendMessage(STAFF_GROUP_ID, t('staff.rejected_notice', { REF: s.ref }));
-
-        /* === DATA LAYER ADD: markRejected ================================= */
-        try {
-          if (DataEvents && typeof DataEvents.markRejected === 'function') {
-            const fRej = parseOrderFields(s.summary || '');
-            await DataEvents.markRejected({
-              order_id: s.ref,
-              date: new Date().toISOString().slice(0,10),
-              time_ordered: new Date().toISOString().slice(11,19),
-              customer_name: fRej.customerName || '',
-              email: fRej.email || '',
-              phone: fRej.phone || '',
-              payment_status: 'rejected',
-              delivery_location: fRej.area || '',
-              product_price: fRej.total || '',
-              delivery_price: fRej.delivery || '',
-              type_chosen: fRej.type || '',
-              roast_level: fRej.roast || '',
-              size: fRej.size || '',
-              qty: fRej.qty || ''
-            });
-          }
-        } catch (e) { console.warn('[data_layer] markRejected failed (non-fatal):', e?.message); }
-        /* ================================================================== */
-
         return ctx.answerCbQuery('Rejected.');
       }
     }
@@ -611,30 +552,6 @@ bot.on('callback_query', async (ctx, next) => {
           driver_phone: d ? d.phone : '',
           status: 'ASSIGNED'
         });
-
-        /* === DATA LAYER ADD: assignDriver ================================== */
-        try {
-          if (DataEvents && typeof DataEvents.assignDriver === 'function') {
-            await DataEvents.assignDriver({
-              order_id: s.ref,
-              driver_name: d ? d.name : `id_${ctx.from.id}`,
-              driver_accepted_time: new Date().toISOString(),
-              // optional extras for your sheet columns:
-              customer_name: f.customerName || '',
-              email: f.email || '',
-              phone: f.phone || '',
-              delivery_location: f.area || '',
-              product_price: f.total || '',
-              delivery_price: f.delivery || '',
-              type_chosen: f.type || '',
-              roast_level: f.roast || '',
-              size: f.size || '',
-              qty: f.qty || ''
-            });
-          }
-        } catch (e) { console.warn('[data_layer] assignDriver failed (non-fatal):', e?.message); }
-        /* ================================================================== */
-
         return;
       } else {
         return ctx.answerCbQuery(get(MSG,'driver.declined_ok') || 'Declined. Thanks.');
@@ -665,18 +582,6 @@ bot.on('callback_query', async (ctx, next) => {
         await ctx.answerCbQuery(get(MSG,'driver.picked_marked') || 'Picked.');
         if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.picked_up', { REF: s.ref, USER_ID: ctx.from.id }));
         if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.picked_up', { REF: s.ref })).catch(()=>{});
-
-        /* === DATA LAYER ADD: markPicked ==================================== */
-        try {
-          if (DataEvents && typeof DataEvents.markPicked === 'function') {
-            await DataEvents.markPicked({
-              order_id: s.ref,
-              driver_picked_time: new Date().toISOString()
-            });
-          }
-        } catch (e) { console.warn('[data_layer] markPicked failed (non-fatal):', e?.message); }
-        /* ================================================================== */
-
         return;
       } else {
         s.status = 'DELIVERED';
@@ -701,18 +606,6 @@ bot.on('callback_query', async (ctx, next) => {
           driver_phone: dInfo2 ? dInfo2.phone : '',
           status: 'DELIVERED'
         });
-
-        /* === DATA LAYER ADD: markDelivered ================================= */
-        try {
-          if (DataEvents && typeof DataEvents.markDelivered === 'function') {
-            await DataEvents.markDelivered({
-              order_id: s.ref,
-              driver_delivered_time: new Date().toISOString()
-            });
-          }
-        } catch (e) { console.warn('[data_layer] markDelivered failed (non-fatal):', e?.message); }
-        /* ================================================================== */
-
         return;
       }
     }
@@ -749,19 +642,6 @@ async function finalizeApproval(s) {
       payment_method: s.method || '',
       status: 'APPROVED'
     });
-
-    /* === DATA LAYER ADD: recordApproved (optional) ========================= */
-    try {
-      if (DataEvents && typeof DataEvents.markPaid === 'function') {
-        await DataEvents.markPaid({
-          order_id: s.ref,
-          date: new Date().toISOString().slice(0,10),
-          time_ordered: new Date().toISOString().slice(11,19),
-          payment_status: 'accepted'
-        });
-      }
-    } catch (e) { console.warn('[data_layer] markPaid(approved) failed (non-fatal):', e?.message); }
-    /* ====================================================================== */
 
     await broadcastToDrivers(s);
     setDriverTimer(s.ref);
@@ -922,38 +802,6 @@ try {
   }
 })();
 
-/* === DATA LAYER ADDITIONS: minimal ops server for CSV export =============== */
-let server = null;
-try {
-  const express = require('express');
-  const app = express();
-
-  app.get('/health', (_req, res) => res.status(200).send('ok'));
-
-  app.get('/ops/export.csv', async (req, res) => {
-    try {
-      const token = String(req.query.token || '');
-      if (!OPS_TOKEN || token !== OPS_TOKEN) return res.status(403).send('forbidden');
-      if (!DataEvents || typeof DataEvents.exportCSV !== 'function') {
-        return res.status(503).send('data layer not ready');
-      }
-      const csvText = await DataEvents.exportCSV();
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', 'attachment; filename="orders_export.csv"');
-      return res.status(200).send(csvText || '');
-    } catch (e) {
-      console.error('/ops/export.csv error', e);
-      return res.status(500).send('error');
-    }
-  });
-
-  const PORT = Number(process.env.PORT || 3000);
-  server = app.listen(PORT, () => console.log(`[ops] listening on :${PORT}`));
-} catch (e) {
-  console.warn('[ops] express not installed; ops endpoints disabled. Install with: npm i express');
-}
-/* ========================================================================== */
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Launch
 bot.launch().then(() => console.log('Polling started…'));
@@ -962,4 +810,6 @@ process.once('SIGTERM', () => bot.stop('SIGTERM'));
 // ─────────────────────────────────────────────────────────────────────────────
 // HOLD-FIX OVERRIDE (paste-and-go)
 // Ensures customer DM ("payment confirmed") is only sent AFTER the full hold window.
-// Works without changing the existing approve/undo code paths. drop final
+// Works without changing the existing approve/undo code paths.
+
+
