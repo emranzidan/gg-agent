@@ -233,7 +233,7 @@ async function postSheets(event, data = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Health & basics
+/** Health & basics **/
 bot.start(async (ctx) => {
   const txt = ctx.message?.text || '';
   const payload = txt.split(' ')[1];
@@ -528,6 +528,11 @@ bot.on('callback_query', async (ctx, next) => {
         await ctx.reply(assignedCard, driverActions);
         await ctx.answerCbQuery('Assigned to you.');
 
+        // OPEN UNDO (15s) for ACCEPT
+        if (typeof global.tryOpenUndo === 'function') {
+          await global.tryOpenUndo('accept', s.ref, ctx.from.id);
+        }
+
         const d = drivers.get(ctx.from.id);
         if (STAFF_GROUP_ID) {
           await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_accepted', {
@@ -578,6 +583,11 @@ bot.on('callback_query', async (ctx, next) => {
         await ctx.answerCbQuery(get(MSG,'driver.giveup_ok') || 'Given up.');
         await broadcastToDrivers(s, quitterId);
         setDriverTimer(s.ref);
+
+        // OPEN UNDO (15s) for GIVEUP (lets same driver reclaim)
+        if (typeof global.tryOpenUndo === 'function') {
+          await global.tryOpenUndo('giveup', s.ref, quitterId);
+        }
         return;
       }
 
@@ -586,6 +596,11 @@ bot.on('callback_query', async (ctx, next) => {
         await ctx.answerCbQuery(get(MSG,'driver.picked_marked') || 'Picked.');
         if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.picked_up', { REF: s.ref, USER_ID: ctx.from.id }));
         if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.picked_up', { REF: s.ref })).catch(()=>{});
+
+        // OPEN UNDO (15s) for PICKED
+        if (typeof global.tryOpenUndo === 'function') {
+          await global.tryOpenUndo('picked', s.ref, ctx.from.id);
+        }
         return;
       } else {
         s.status = 'DELIVERED';
@@ -632,6 +647,11 @@ bot.on('callback_query', async (ctx, next) => {
         } catch (e) {
           console.error('persist(delivered) error', e);
           if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${s.ref} (delivered)`).catch(()=>{});
+        }
+
+        // OPEN UNDO (15s) for DELIVERED
+        if (typeof global.tryOpenUndo === 'function') {
+          await global.tryOpenUndo('delivered', s.ref, ctx.from.id);
         }
         return;
       }
@@ -917,7 +937,7 @@ try {
     }
   });
 
-  // Expose the opener to the rest of file (used by 4 one-liners)
+  // Expose the opener to the rest of file (used by one-liners above)
   global.tryOpenUndo = tryOpenUndo;
 
 } catch (e) {
