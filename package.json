@@ -8,7 +8,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^1.35.7"
+    "@supabase/supabase-js": "^1.35.7",
     "dotenv": "^16.6.1",
     "luxon": "^3.7.1",
     "telegraf": "^4.16.3"
