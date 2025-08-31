@@ -25,8 +25,8 @@
     "order_in_progress_note": "You already have an order in progress (Ref {REF}). If this is urgent, contact support at {SUPPORT_PHONE}.",
     "existing_awaiting_payment_nudge": "You’re still on order {REF}. Choose a payment method or send your receipt.",
     "awaiting_receipt_text": "Please send a clear screenshot/photo of your payment receipt.",
-    "payment_info_telebirr": "📱 Telebirr\nMerchant: Green Gold Ethiopia plc\nMerchant ID: 86555\nPhone: +251 904122222\nAmount: ETB {TOTAL}\n\nAfter payment, please upload your receipt screenshot here.",
-    "payment_info_cbe": "🏦 Commercial Bank of Ethiopia (CBE)\nAccount Name: Green Gold Ethiopia\nAccount Number: 1000387118806\nBranch: Bambis Branch\nAmount to pay: ETB {TOTAL}\n\nAfter transfer, please upload your receipt screenshot here.",
+   "payment_info_telebirr": "📱 Telebirr\nMerchant: <b>Green Gold Ethiopia plc</b>\nMerchant ID: <code>86555</code>\nPhone: <code>+251904122222</code>\nAmount: <b>ETB {TOTAL}</b>\n\nAfter payment, please upload your receipt screenshot here.",
+    "payment_info_cbe": "🏦 Commercial Bank of Ethiopia (CBE)\nAccount Name: <b>Green Gold Ethiopia</b>\nAccount Number: <code>1000387118806</code>\nBranch: <b>Bambis Branch</b>\nAmount to pay: <b>ETB {TOTAL}</b>\n\nAfter transfer, please upload your receipt screenshot here."
     "receipt_received": "👍 Receipt received for {REF}. We’ll review and confirm shortly.",
     "payment_rejected": "❌ Payment for {REF} was not approved. Please resend a clear screenshot or contact support at {SUPPORT_PHONE}.",
     "payment_confirmed_after_hold": "✅ Payment confirmed for {REF}. We’re assigning a driver now.",
