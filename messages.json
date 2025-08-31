@@ -16,7 +16,6 @@
     "clear_prev_yes": "Clear previous",
     "clear_prev_no": "Keep & continue",
 
-    /* labels for optional tap-to-copy buttons (code change needed to use) */
     "copy_merchant_id": "Copy Merchant ID",
     "copy_cbe_account": "Copy Account Number"
   },
