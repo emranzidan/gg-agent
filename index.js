@@ -1,7 +1,4 @@
-
-
-
-// index.js — GreenGold EMMA (God Mode, modular, Sheets-ready)
+// index.js — GreenGold EMMA (God Mode, Supabase memory wired)
 // Stable entrypoint. Conversations are handled in ./flows/customerBotFlow.js
 // State & refs live in ./core/session.js. Parsing in ./parser.js
 'use strict';
@@ -11,6 +8,10 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const fs   = require('fs');
 const path = require('path');
+
+// EMMA2: memory + export wiring
+const { persist } = require('./data_ops/memory');           // <— NEW
+const wireExportCommands = require('./commands/export');    // <— NEW
 
 // Order detection / parsing brain
 const {
@@ -158,6 +159,9 @@ try {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
+
+// EMMA2: wire commands (/test_memory, /export …)
+try { wireExportCommands(bot); } catch (e) { console.warn('export commands not wired:', e.message); }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilities
@@ -606,6 +610,29 @@ bot.on('callback_query', async (ctx, next) => {
           driver_phone: dInfo2 ? dInfo2.phone : '',
           status: 'DELIVERED'
         });
+
+        // EMMA2: persist delivered → Supabase
+        try {
+          const orderObj = {
+            order_id: s.ref,
+            customer_name:  f3.customerName || null,
+            email:          null,
+            phone:          f3.phone || null,
+            payment_status: 'approved',
+            driver_name:    (dInfo2 ? dInfo2.name : 'Driver'),
+            delivery_location: f3.area || null,
+            product_price:  Number(String(f3.total||'').replace(/[^\d.]/g,'')) || null,
+            delivery_price: Number(String(f3.delivery||'').replace(/[^\d.]/g,'')) || null,
+            type_chosen:    f3.type  || null,
+            roast_level:    f3.roast || null,
+            size:           f3.size  || null,
+            qty:            f3.qty   || null
+          };
+          await persist(orderObj, 'delivered', { tz: TIMEZONE });
+        } catch (e) {
+          console.error('persist(delivered) error', e);
+          if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${s.ref} (delivered)`).catch(()=>{});
+        }
         return;
       }
     }
@@ -642,6 +669,31 @@ async function finalizeApproval(s) {
       payment_method: s.method || '',
       status: 'APPROVED'
     });
+
+    // EMMA2: persist payment_confirmed → Supabase
+    try {
+      const orderObj = {
+        order_id: s.ref,
+        customer_name:  f.customerName || null,
+        email:          null,
+        phone:          f.phone || null,
+        payment_status: 'approved',
+        driver_name:    null,
+        delivery_location: f.area || null,
+        product_price:  Number(String(f.total||'').replace(/[^\d.]/g,'')) || null,
+        delivery_price: Number(String(f.delivery||'').replace(/[^\d.]/g,'')) || null,
+        type_chosen:    f.type  || null,
+        roast_level:    f.roast || null,
+        size:           f.size  || null,
+        qty:            f.qty   || null,
+        date:           null,   // let persist infer from createdAt
+        time_ordered:   null
+      };
+      await persist(orderObj, 'payment_confirmed', { tz: TIMEZONE, createdAtMs: s.createdAt });
+    } catch (e) {
+      console.error('persist(payment_confirmed) error', e);
+      if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${s.ref} (payment_confirmed)`).catch(()=>{});
+    }
 
     await broadcastToDrivers(s);
     setDriverTimer(s.ref);
@@ -725,7 +777,7 @@ try {
   console.warn('flows/customerBotFlow missing — customer conversations will be inactive until you add it.');
 }
 
- // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // HOLD-DM INTERCEPTOR (no edits elsewhere)
 // If a message matches customer.payment_confirmed_after_hold, delay it until hold is over.
 (function deferPaymentConfirmedDM() {
@@ -803,7 +855,6 @@ try {
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Launch
 bot.launch().then(() => console.log('Polling started…'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
@@ -811,5 +862,3 @@ process.once('SIGTERM', () => bot.stop('SIGTERM'));
 // HOLD-FIX OVERRIDE (paste-and-go)
 // Ensures customer DM ("payment confirmed") is only sent AFTER the full hold window.
 // Works without changing the existing approve/undo code paths.
-
-
