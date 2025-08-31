@@ -798,26 +798,6 @@ try {
     console.error('deferPaymentConfirmedDM init error:', e);
   }
 })();
-// ─────────────────────────────────────────────────────────────────────────────
-// PAYMENT MARKUP BOOSTER (no edits elsewhere)
-// If the outgoing text contains HTML tags (b/u/code), force parse_mode='HTML' so it renders.
-(function paymentMarkupBooster() {
-  try {
-    if (!bot?.telegram?.sendMessage) return;
-    const originalSend = bot.telegram.sendMessage.bind(bot.telegram);
-
-    bot.telegram.sendMessage = function(chatId, text, extra = {}) {
-      try {
-        if (typeof text === 'string' && /<(?:b|u|code)>/i.test(text)) {
-          extra = { parse_mode: 'HTML', disable_web_page_preview: true, ...extra };
-        }
-      } catch {}
-      return originalSend(chatId, text, extra);
-    };
-  } catch (e) {
-    console.error('paymentMarkupBooster init error:', e);
-  }
-})();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Launch
