@@ -9,7 +9,7 @@ module.exports = function wireCustomerFlow(bot, deps) {
     SUPPORT_PHONE,
     SUPPORT_GROUP_ID,
     STAFF_GROUP_ID,
-    BUTTON_TTL_SEC,
+    BUTTON_TTL_SEC, // not used here but kept for parity
     ALLOW_NEW_ORDER,
     // parser helpers
     isLikelyQuestion,
@@ -253,11 +253,39 @@ module.exports = function wireCustomerFlow(bot, deps) {
         s.status = 'AWAITING_RECEIPT';
 
         const f = parseOrderFields(s.summary || '');
+
         if (method === 'telebirr') {
-          await ctx.reply(t('customer.payment_info_telebirr', { TOTAL: f.total || '—' }));
+          // Payment text
+          await ctx.reply(
+            t('customer.payment_info_telebirr', { TOTAL: f.total || '—' }),
+            {
+              // Inline button that copies the Merchant ID
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: get(MSG,'buttons.copy_merchant_id') || 'Copy Merchant ID', copy_text: { text: '86555' } }
+                  ]
+                ]
+              }
+            }
+          );
         } else {
-          await ctx.reply(t('customer.payment_info_cbe', { TOTAL: f.total || '—' }));
+          // Bank text
+          await ctx.reply(
+            t('customer.payment_info_cbe', { TOTAL: f.total || '—' }),
+            {
+              // Inline button that copies the Account Number
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: get(MSG,'buttons.copy_cbe_account') || 'Copy Account Number', copy_text: { text: '1000387118806' } }
+                  ]
+                ]
+              }
+            }
+          );
         }
+
         await ctx.answerCbQuery('Payment info sent.');
 
         if (STAFF_GROUP_ID) {
