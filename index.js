@@ -721,12 +721,8 @@ try {
 } catch (e) {
   console.warn('flows/customerBotFlow missing — customer conversations will be inactive until you add it.');
 }
-// ─────────────────────────────────────────────────────────────────────────────
-// HOLD-FIX OVERRIDE (paste-and-go)
-// Ensures customer DM ("payment confirmed") is only sent AFTER the full hold window.
-// Works without changing existing approve/undo code paths.
 
-// ─────────────────────────────────────────────────────────────────────────────
+ // ─────────────────────────────────────────────────────────────────────────────
 // HOLD-DM INTERCEPTOR (no edits elsewhere)
 // If a message matches customer.payment_confirmed_after_hold, delay it until hold is over.
 (function deferPaymentConfirmedDM() {
@@ -756,22 +752,34 @@ try {
         if (ref && typeof Session?.getSessionByRef === 'function') {
           const s = Session.getSessionByRef(ref);
 
-          // only intercept the specific "payment confirmed after hold" DM during hold
+          // only intercept the specific "payment confirmed after hold" DM
           const isHoldDM = tpl ? (str === tpl.replace('{REF}', ref)) : /payment/i.test(str) && /confirm/i.test(str);
 
-          if (isHoldDM && s && s.status === 'APPROVED_HOLD') {
+          if (isHoldDM && s) {
             const holdMs = (typeof HOLD_SECONDS === 'number' && HOLD_SECONDS > 0 ? HOLD_SECONDS : 60) * 1000;
+
+            // if staff hit Undo, status will NOT be APPROVED_HOLD/DISPATCHING → do not send
+            const okStatuses = new Set(['APPROVED_HOLD','DISPATCHING']);
+            if (!okStatuses.has(s.status)) {
+              // swallow if not in hold/dispatch (i.e., undone)
+              return;
+            }
+
             const started = s.holdActivatedAt || Date.now();
             s.holdActivatedAt = started;
 
             const elapsed = Date.now() - started;
             const delay = Math.max(0, holdMs - elapsed);
 
-            // schedule the DM for when the hold actually ends; send only once
             setTimeout(() => {
               try {
-                if (s.status === 'APPROVED_HOLD' && !s.confirmationSent) {
-                  s.confirmationSent = true;
+                // re-check that we didn't get undone
+                const s2 = Session.getSessionByRef(ref);
+                if (!s2) return;
+                if (!okStatuses.has(s2.status)) return; // e.g., undone back to AWAITING_RECEIPT
+
+                if (!s2.confirmationSent) {
+                  s2.confirmationSent = true;
                   originalSend(chatId, text, extra).catch(()=>{});
                 }
               } catch {}
@@ -782,7 +790,7 @@ try {
           }
         }
       } catch {
-        // if anything blows up, fall through to default send
+        // on any parsing error, just fall through
       }
       return originalSend(chatId, text, extra);
     };
