@@ -1,29 +1,52 @@
 // commands/cleanmemory.js
-// Owner-only one-shot archive & prune.
-// Usage (DM only):
-//   /cleanmemory preview           -> show how many rows are eligible (no delete)
-//   /cleanmemory run               -> export CSV of ALL rows before this month, then delete them
-//   /cleanmemory run older 90      -> export CSV of rows older than 90 days, then delete them
-//   /cleanmemory run before 01/09/2025 -> export CSV of rows with date < 01/09/2025, then delete them
-//
-// To wire it in index.js (near wireExportCommands):
-//   try { require('./commands/cleanmemory')(bot, { ownerIds: OWNER_IDS }); } catch (e) { console.warn('cleanmemory not wired:', e.message); }
-
+// Owner-only: archive (CSV export) then prune persisted orders.
+// No top-level bot usage — everything is wired via the exported function.
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
+module.exports = (bot) => {
+  // Resolve owners from env (same convention as index.js)
+  const ownerIds = String(process.env.OWNER_IDS || '')
+    .split(',')
+    .map(s => Number(s.trim()))
+    .filter(Number.isFinite);
 
-let createClient = null;
-try { ({ createClient } = require('@supabase/supabase-js')); } catch (_) {}
+  const isOwner   = (ctx) => ownerIds.includes(ctx.from?.id);
+  const isPrivate = (ctx) => ctx.chat?.type === 'private';
 
-const SUPABASE_URL  = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
-const SUPABASE_KEY  = process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
-const TABLE         = process.env.SUPABASE_TABLE || 'orders';
-const HAS_SB        = !!(createClient && SUPABASE_URL && SUPABASE_KEY);
-const sb            = HAS_SB ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+  // Data layer (Supabase-backed with local fallback)
+  const { exportCsv, pruneOrders } = require('../data_ops/memory');
 
-// Local fallback used by data_ops/memory
-const LOCAL_FILE = path.join(__dirname, '..', 'data_ops', 'memory', 'local_orders.json');
+  /**
+   * /cleanmemory [range]
+   * Examples:
+   *   /cleanmemory                -> defaults to "last-month"
+   *   /cleanmemory last-month
+   *   /cleanmemory older 90
+   *   /cleanmemory before 2025-09-01
+   *
+   * Behavior:
+   *   1) Export matching rows to a CSV (returns filename + row count).
+   *   2) If export succeeds, prune the same rows.
+   *   3) Reply with counts and the CSV filename.
+   */
+  bot.command('cleanmemory', async (ctx) => {
+    if (!isOwner(ctx) || !isPrivate(ctx)) return;
 
-// ...[rest of file is already correct, no markdown/code fence artifacts found]
+    const range = ctx.message.text.split(' ').slice(1).join(' ').trim() || 'last-month';
+
+    try {
+      await ctx.reply(`⏳ Archiving rows for range: "${range}"…`);
+      const { filename, rows } = await exportCsv(range); // throws on failure
+      const pruned = await pruneOrders(range);
+
+      await ctx.reply(
+        `✅ Archive & prune complete.\n` +
+        `• Archived (CSV): ${rows} rows → ${filename}\n` +
+        `• Pruned (deleted): ${pruned} rows`
+      );
+    } catch (e) {
+      console.error('cleanmemory error:', e);
+      await ctx.reply(`⚠️ Clean aborted: ${e?.message || 'unknown error'}`);
+    }
+  });
+};
