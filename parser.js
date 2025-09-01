@@ -1,13 +1,7 @@
 // parser.js — tolerant order detection & field extraction (Green Gold)
-// API kept identical: isLikelyQuestion, isOrderSummaryStrict, parseOrderFields, extractRef
-// Supports flexible, emoji-rich summaries like the sample provided by Emru.
-// Extracts:
-//   - ref (GG-YYYYMMDD-HHMMSS-XXXX)
-//   - items [{roast, type, size_g, qty, unit_price, line_total}]
-//   - delivery fee, distance (km), pickup/store
-//   - total (ETB)
-//   - identity: customerName (👤 …), phone (📞 …), email (📧 …), address (📍 …), map url (Google Maps)
-//   - derived: qty (sum of item qty), area (short location hint)
+// API: isLikelyQuestion, isOrderSummaryStrict, parseOrderFields, extractRef
+// Extracts from emoji-rich summaries and multiple ID styles.
+// Supports refs like "GG-20250831-235519-D1XB" and "GG_TEST_20250831_1952" and "GG_9JOW".
 
 'use strict';
 
@@ -29,11 +23,18 @@ function isLikelyQuestion(text) {
   return triggers.some(w => s.includes(w));
 }
 
+// Robustly pick the first GG reference (dash or underscore styles)
 function extractRef(text) {
   if (!text) return '';
-  // GG-20250829-145504-SI3L
-  const m = text.match(/GG-\d{8}-\d{6}-[A-Z0-9]{3,12}/i);
-  return m ? m[0] : '';
+  // Try full dash style first: GG-YYYYMMDD-HHMMSS-XXXX
+  const mDash = text.match(/(?:^|\s)(GG-\d{8}-\d{6}-[A-Z0-9_-]{3,})/i);
+  if (mDash) return mDash[1];
+
+  // Fallback: any GG_ token up to whitespace/punct
+  const mUnder = text.match(/(?:^|\s)(GG[_-][A-Z0-9][A-Z0-9_\-]*)/i);
+  if (mUnder) return mUnder[1];
+
+  return '';
 }
 
 function isOrderSummaryStrict(text, opts = {}) {
@@ -45,13 +46,14 @@ function isOrderSummaryStrict(text, opts = {}) {
   if (s.length < minLen) return false;
 
   const anchors = [
-    /GG-\d{8}-\d{6}-[A-Z0-9]{3,12}/i,       // Order ref
-    /Total:\s*ETB\s*[\d,]+/i,               // Total line
-    /Delivery\s*Fee:\s*ETB\s*[\d,]+/i,      // Delivery fee
-    /🫘\s*Roast:/i, /Roast:\s*[A-Za-z]/i,    // Any item block
-    /📞/i, /Phone:/i,                        // Phone
+    /GG-\d{8}-\d{6}-[A-Z0-9_-]{3,}/i,     // Dash ref
+    /GG[_-][A-Z0-9][A-Z0-9_\-]*/i,        // Underscore/loose ref
+    /Total:\s*ETB\s*[\d,]+/i,             // Total line
+    /Delivery\s*Fee:\s*ETB\s*[\d,]+/i,    // Delivery fee
+    /🫘\s*Roast:/i, /Roast:\s*[A-Za-z]/i,  // Any item block
+    /📞/i, /Phone:/i,                      // Phone
     /https?:\/\/(?:www\.)?google\.com\/maps\//i, /place_id:/i, // Map
-    /📍\s*Address:/i, /Address:/i,          // Address
+    /📍\s*Address:/i, /Address:/i,        // Address
   ];
 
   let score = 0;
@@ -75,7 +77,6 @@ function toFloat(str) {
 function safeTrim(s) {
   return (s || '').toString().trim();
 }
-
 function splitLines(text) {
   return String(text)
     .replace(/\r/g, '')
@@ -83,7 +84,6 @@ function splitLines(text) {
     .map(s => s.trim())
     .filter(Boolean);
 }
-
 function extractAfterEmojiOrLabel(lines, emoji, labelRegex) {
   // Prefer emoji line, else labeled line.
   for (const line of lines) {
@@ -101,7 +101,6 @@ function extractAfterEmojiOrLabel(lines, emoji, labelRegex) {
   }
   return '';
 }
-
 function extractGoogleMapsUrl(text) {
   // Any google maps url, including place_id
   const url = text.match(/https?:\/\/(?:www\.)?google\.com\/maps\/[^\s)]+/i);
@@ -110,12 +109,7 @@ function extractGoogleMapsUrl(text) {
   if (place) return place[0];
   return '';
 }
-
 function guessArea(address, pickup) {
-  // Area heuristic:
-  // 1) If address contains comma, take first segment.
-  // 2) Else if pickup exists, use that.
-  // 3) Else return '—'
   const a = safeTrim(address);
   if (a) {
     const seg = a.split(',').map(s => s.trim()).filter(Boolean)[0];
@@ -123,6 +117,40 @@ function guessArea(address, pickup) {
   }
   const p = safeTrim(pickup);
   return p || '—';
+}
+
+function leftPad2(n) { n = String(n); return n.length === 1 ? '0' + n : n; }
+function deriveDateTimeFromRef(ref) {
+  // Returns: { date_iso: 'YYYY-MM-DD', date: 'DD/MM/YYYY', time_hms: 'HH:MM:SS', time_ordered: 'HH:MM' } or nulls
+  if (!ref) return { date_iso: null, date: null, time_hms: null, time_ordered: null };
+
+  // GG-YYYYMMDD-HHMMSS-XXXX
+  let m = ref.match(/^GG-(\d{8})-(\d{6})-/i);
+  if (m) {
+    const y = m[1].slice(0,4), M = m[1].slice(4,6), d = m[1].slice(6,8);
+    const hh = m[2].slice(0,2), mm = m[2].slice(2,4), ss = m[2].slice(4,6);
+    return {
+      date_iso: `${y}-${M}-${d}`,
+      date: `${d}/${M}/${y}`,
+      time_hms: `${hh}:${mm}:${ss}`,
+      time_ordered: `${hh}:${mm}`,
+    };
+  }
+
+  // GG_*_YYYYMMDD_HHMM (e.g., GG_TEST_20250831_1952) or GG_*_YYYYMMDDHHMM
+  m = ref.match(/(\d{8})[_-]?(\d{4,6})$/);
+  if (m) {
+    const y = m[1].slice(0,4), M = m[1].slice(4,6), d = m[1].slice(6,8);
+    const hh = m[2].slice(0,2), mm = m[2].slice(2,4), ss = m[2].length === 6 ? m[2].slice(4,6) : '00';
+    return {
+      date_iso: `${y}-${M}-${d}`,
+      date: `${d}/${M}/${y}`,
+      time_hms: `${hh}:${mm}:${ss}`,
+      time_ordered: `${hh}:${mm}`,
+    };
+  }
+
+  return { date_iso: null, date: null, time_hms: null, time_ordered: null };
 }
 
 // -------------------- items parser --------------------
@@ -135,7 +163,6 @@ function extractItems(lines) {
   }
   function pushIfFilled() {
     if (!cur) return;
-    // consider an item if at least one field was seen
     const touched = cur.roast || cur.type || cur.size_g || cur.qty || cur.unit_price || cur.line_total;
     if (touched) items.push({ ...cur });
     cur = null;
@@ -144,7 +171,7 @@ function extractItems(lines) {
   for (let i = 0; i < lines.length; i++) {
     const L = lines[i];
 
-    // New item can be indicated by Roast line
+    // New item often starts at Roast
     if (/🫘\s*Roast:/i.test(L) || /^Roast:/i.test(L)) {
       pushIfFilled();
       ensureItem();
@@ -162,7 +189,7 @@ function extractItems(lines) {
 
     if (/⚖️\s*Size:/i.test(L) || /^Size:/i.test(L)) {
       ensureItem();
-      // e.g., Size: 250 g
+      // e.g., Size: 250 g, 1000 g, 250g
       const m = L.match(/Size:\s*([\d.,]+)\s*g/i);
       if (m) cur.size_g = Math.round(parseFloat(m[1].replace(',', '.')));
       continue;
@@ -176,9 +203,9 @@ function extractItems(lines) {
     }
 
     if (/💸/i.test(L) || /ETB/i.test(L)) {
-      // 💸 ETB 595 x 2 = ETB 1190
+      // 💸 ETB 2125 x 2 = ETB 4250
       ensureItem();
-      const unit = L.match(/ETB\s*([\d,]+)/i);
+      const unit = L.match(/ETB\s*([\d,]+)\s*(?:x|×)?/i);
       const qty  = L.match(/x\s*(\d+)/i);
       const line = L.match(/=\s*ETB\s*([\d,]+)/i);
       if (unit) cur.unit_price = cleanMoney(unit[1]);
@@ -190,6 +217,20 @@ function extractItems(lines) {
 
   pushIfFilled();
   return items;
+}
+
+function choosePrimaryItem(items) {
+  if (!items || !items.length) return null;
+  // Sort by qty desc, then line_total desc, then size_g desc
+  const sorted = [...items].sort((a, b) => {
+    const qa = Number(a.qty || 0), qb = Number(b.qty || 0);
+    if (qb !== qa) return qb - qa;
+    const la = Number(a.line_total || 0), lb = Number(b.line_total || 0);
+    if (lb !== la) return lb - la;
+    const sa = Number(a.size_g || 0), sb = Number(b.size_g || 0);
+    return sb - sa;
+  });
+  return sorted[0];
 }
 
 // -------------------- main parser --------------------
@@ -221,22 +262,34 @@ function parseOrderFields(text, opts = {}) {
   );
 
   const customerName = extractAfterEmojiOrLabel(lines, '👤', /^(?:Customer|Name):/i);
+
   // Phone: prefer "📞 ..." line; else any phone-ish pattern
   let phone = extractAfterEmojiOrLabel(lines, '📞', /^(?:Phone|Tel|Mobile):/i);
   if (!phone) {
     const m = raw.match(/(\+?\d[\d\s().\-]{6,})/);
     phone = m ? m[1].trim() : '';
   }
+
   const emailMatch = raw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   const email = emailMatch ? emailMatch[0] : '';
 
   const address = extractAfterEmojiOrLabel(lines, '📍', /^(?:Address|Location):/i);
   const map = extractGoogleMapsUrl(raw);
 
+  // Items + top-level (dominant) fields for compatibility
   const items = extractItems(lines);
   const qty = items.reduce((sum, it) => sum + (Number(it.qty) || 0), 0);
 
+  const primary = choosePrimaryItem(items);
+  const type  = primary?.type  || '';
+  const roast = primary?.roast || '';
+  // top-level size as a friendly string (e.g., "1000g")
+  const size  = primary?.size_g ? `${primary.size_g}g` : '';
+
   const area = guessArea(address, pickup);
+
+  // Optional date/time derivation from ref
+  const { date_iso, date, time_hms, time_ordered } = deriveDateTimeFromRef(ref);
 
   return {
     ok: true,
@@ -256,6 +309,15 @@ function parseOrderFields(text, opts = {}) {
     // items
     items,
     qty,
+    // convenient single-item style (dominant)
+    type,
+    roast,
+    size,
+    // derived timestamps (non-breaking extras)
+    date_iso,       // "YYYY-MM-DD"
+    date,           // "DD/MM/YYYY"
+    time_hms,       // "HH:MM:SS"
+    time_ordered,   // "HH:MM"
   };
 }
 
