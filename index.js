@@ -9,10 +9,9 @@ const { Telegraf, Markup } = require('telegraf');
 const fs   = require('fs');
 const path = require('path');
 
-// EMMA2: memory + export wiring
-const { persist } = require('./data_ops/memory');           // NEW
-const wireExportCommands = require('./commands/export');    // NEW
-const wireCleanMemoryCommands = require('./commands/cleanmemory'); // NEW
+// EMMA: NEW storage + export wiring (replaces old memory/export attempt)
+const store = require('./services/orderStore');                  // NEW
+const wireAdminExportFlow = require('./flows/adminExportFlow');  // NEW
 
 // Order detection / parsing brain
 const {
@@ -165,10 +164,6 @@ try {
 // ────────────────────────────────────────────────────────────────────────────────
 // IMPORTANT: Create bot BEFORE any bot.* usage or wiring
 const bot = new Telegraf(BOT_TOKEN);
-
-// Wire extra command modules
-try { wireExportCommands(bot); } catch (e) { console.warn('export commands not wired:', e.message); }
-try { wireCleanMemoryCommands(bot); } catch (e) { console.warn('cleanmemory commands not wired:', e.message); }
 
 // ────────────────────────────────────────────────────────────────────────────────
 // Utilities
@@ -328,6 +323,10 @@ function scheduleAcceptEffects(ref, driverId) {
         REF: ref, DRIVER_NAME: d ? d.name : 'Assigned driver', DRIVER_PHONE: d ? d.phone : '—'
       })).catch(()=>{});
     }
+
+    // NEW: persist driver accepted time
+    try { await store.saveDriverEvent(ref, 'accepted', d ? d.name : ''); } catch(e) { console.warn('store.accepted error', e.message); }
+
     await postSheets('assigned', {
       ref,
       customer_name: f.customerName || '',
@@ -354,6 +353,10 @@ function schedulePickedEffects(ref, driverId) {
 
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.picked_up', { REF: ref, USER_ID: driverId })).catch(()=>{});
     if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.picked_up', { REF: ref })).catch(()=>{});
+
+    // NEW: persist driver picked time
+    const d = drivers.get(driverId);
+    try { await store.saveDriverEvent(ref, 'picked', d ? d.name : ''); } catch(e) { console.warn('store.picked error', e.message); }
   });
 }
 
@@ -384,26 +387,16 @@ function scheduleDeliveredEffects(ref, driverId) {
       status: 'DELIVERED'
     });
 
-    // Persist to Supabase
+    // NEW: persist delivered time (+ ensure intake exists)
     try {
-      const orderObj = {
-        order_id: s.ref,
-        customer_name:  f3.customerName || null,
-        email:          null,
-        phone:          f3.phone || null,
-        payment_status: 'approved',
-        driver_name:    (dInfo2 ? dInfo2.name : 'Driver'),
-        delivery_location: f3.area || null,
-        product_price:  Number(String(f3.total||'').replace(/[^\d.]/g,'')) || null,
-        delivery_price: Number(String(f3.delivery||'').replace(/[^\d.]/g,'')) || null,
-        type_chosen:    f3.type  || null,
-        roast_level:    f3.roast || null,
-        size:           f3.size  || null,
-        qty:            f3.qty   || null
-      };
-      await persist(orderObj, 'delivered', { tz: TIMEZONE });
+      // ensure we have an intake row (idempotent upsert)
+      const fields = mapFieldsFromSummary(f3, s.summary);
+      fields.order_id = ref;
+      await store.saveOrderIntake(fields); // no ctx: falls back to now if missing
+      await store.savePaymentStatus(ref, 'approved'); // final state
+      await store.saveDriverEvent(ref, 'delivered', dInfo2 ? dInfo2.name : '');
     } catch (e) {
-      console.error('persist(delivered) error', e);
+      console.error('store(delivered) error', e);
       if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${ref} (delivered)`).catch(()=>{});
     }
   });
@@ -419,6 +412,8 @@ function scheduleGiveupEffects(ref, driverId) {
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_canceled_rebroadcast', { REF: ref, USER_ID: driverId })).catch(()=>{});
     await broadcastToDrivers(s, driverId);
     setDriverTimer(ref);
+
+    // Optional: mark pickup undone (no DB change here)
   });
 }
 
@@ -491,6 +486,30 @@ bot.on('text', async (ctx, next) => {
     return;
   }
   if (typeof next === 'function') return next();
+});
+
+// ────────────────────────────────────────────────────────────────────────────────
+// NEW: Intake capture middleware (non-invasive, runs before flows)
+// Saves: order_id, date/time, email, phone, type, size, roast, prices, total, location.
+bot.on('text', async (ctx, next) => {
+  try {
+    const txt = String(ctx.message?.text || '');
+    if (!txt || txt.length < 20) return (typeof next === 'function' ? next() : undefined);
+
+    // If it looks like an order summary, capture it once.
+    if (isOrderSummaryStrict(txt) || /Order ID:\s*GG-/i.test(txt)) {
+      const parsed = parseOrderFields(txt) || {};
+      const fields  = mapFieldsFromSummary(parsed, txt);
+      fields.order_id = extractRef(txt) || parsed.ref || ''; // GG-...
+      if (fields.order_id) {
+        await store.saveOrderIntake(fields, ctx).catch(e => console.warn('saveOrderIntake error:', e.message));
+      }
+    }
+  } catch (e) {
+    console.warn('intake middleware error:', e.message);
+  } finally {
+    if (typeof next === 'function') return next();
+  }
 });
 
 // Drivers CRUD (+ persistence helpers)
@@ -848,28 +867,14 @@ async function finalizeApproval(s) {
       status: 'APPROVED'
     });
 
-    // EMMA2: persist payment_confirmed → Supabase
+    // EMMA: persist payment_confirmed → Supabase (idempotent)
     try {
-      const orderObj = {
-        order_id: s.ref,
-        customer_name:  f.customerName || null,
-        email:          null,
-        phone:          f.phone || null,
-        payment_status: 'approved',
-        driver_name:    null,
-        delivery_location: f.area || null,
-        product_price:  Number(String(f.total||'').replace(/[^\d.]/g,'')) || null,
-        delivery_price: Number(String(f.delivery||'').replace(/[^\d.]/g,'')) || null,
-        type_chosen:    f.type  || null,
-        roast_level:    f.roast || null,
-        size:           f.size  || null,
-        qty:            f.qty   || null,
-        date:           null,   // let persist infer from createdAt
-        time_ordered:   null
-      };
-      await persist(orderObj, 'payment_confirmed', { tz: TIMEZONE, createdAtMs: s.createdAt });
+      const fields = mapFieldsFromSummary(f, s.summary);
+      fields.order_id = s.ref;
+      await store.saveOrderIntake(fields);                 // upsert intake row if missing
+      await store.savePaymentStatus(s.ref, 'approved');    // mark approved
     } catch (e) {
-      console.error('persist(payment_confirmed) error', e);
+      console.error('store(payment_confirmed) error', e);
       if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${s.ref} (payment_confirmed)`).catch(()=>{});
     }
 
@@ -954,6 +959,53 @@ try {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
+// NEW: wire export commands (/export orders, /clear_and_export_orders)
+try {
+  wireAdminExportFlow(bot, { store });
+  console.log('flows/adminExportFlow wired.');
+} catch (e) {
+  console.error('adminExportFlow wiring failed:', e.message);
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
 bot.launch().then(() => console.log('Polling started…'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Helpers
+function mapFieldsFromSummary(parsed, rawText) {
+  const f = parsed || {};
+  const email = (rawText && (rawText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] || '')) || '';
+  const addrMatch = rawText && rawText.match(/Address:\s*([^\n]+)/i);
+  const address = addrMatch ? addrMatch[1].trim() : (f.area || '');
+  const map_url = f.map || '';
+
+  return {
+    customer_name:  f.customerName || '',
+    email,
+    phone:          f.phone || '',
+    type:           f.type || '',
+    size:           f.size || '',
+    roast_level:    f.roast || '',
+    qty:            f.qty || '',
+    product_price:  null,                 // optional; total/delivery will fill total
+    delivery_price: f.delivery || '',
+    total:          f.total || '',
+    delivery_location: address,
+    map_url,
+  };
+}
+
+function watchFile(fp, onChange) {
+  try {
+    if (!fs.existsSync(fp)) return;
+    fs.watch(fp, { persistent: false }, (ev) => {
+      if (ev === 'change') {
+        try { onChange(); } catch (e) { console.warn('[hot] reload error:', e.message); }
+      }
+    });
+  } catch (e) {
+    console.warn('[hot] watcher failed for', fp, e.message);
+  }
+}
