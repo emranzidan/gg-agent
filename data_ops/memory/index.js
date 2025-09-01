@@ -1,198 +1,276 @@
+// data_ops/memory/index.js
+// Supabase-backed persistence with safe merge + local fallback.
+// Exports: persist(orderObj, phase, { tz?, createdAtMs? })
+
 'use strict';
 
-/**
- * Memory interface for GreenGold orders.
- * Single source of truth: Supabase.
- *
- * Exposes:
- *   - persist(row, phase)         // upsert by order_id, applies phase-specific fields
- *   - fetchAllOrders(range?)      // fetch rows for export
- *   - toCSV(rows)                 // turn rows into CSV with your exact column order
- *   - health()
- *
- * Phases:
- *   'payment_confirmed' | 'driver_accepted' | 'driver_picked' | 'delivered'
- *
- * Env:
- *   STORAGE_MODE=supabase
- *   SUPABASE_URL=...
- *   SUPABASE_SERVICE_KEY=...
- */
+const fs   = require('fs');
+const path = require('path');
 
-const SUPPORTED = new Set(['supabase']);
-const mode = (process.env.STORAGE_MODE || 'supabase').toLowerCase();
-
-if (!SUPPORTED.has(mode)) {
-  throw new Error(`Unsupported STORAGE_MODE=${mode}. Use 'supabase'.`);
+let createClient = null;
+try {
+  ({ createClient } = require('@supabase/supabase-js'));
+} catch (_) {
+  // keep null — we'll use local fallback
 }
 
-const supabase = require('./adapters/supabase'); // File 1/3 you already created
+const SUPABASE_URL  = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const SUPABASE_KEY  = process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+const TABLE         = process.env.SUPABASE_TABLE || 'orders';
 
-// ----------------------- helpers -----------------------
+const HAS_SB = !!(createClient && SUPABASE_URL && SUPABASE_KEY);
+const sb = HAS_SB ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
-function pad2(n) { return String(n).padStart(2, '0'); }
-
-function tzNowParts(tz = 'Africa/Addis_Ababa', fromMs = null) {
-  const d = fromMs ? new Date(fromMs) : new Date();
-  // Date in tz
-  const fmtDate = new Intl.DateTimeFormat('en-GB', { timeZone: tz, day: '2-digit', month: '2-digit', year: 'numeric' });
-  const fmtTime = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false });
-  const [dd, mm, yyyy] = fmtDate.format(d).split('/');
-  const dateDDMMYYYY = `${dd}/${mm}/${yyyy}`;              // for human CSV
-  const timeHHMM = fmtTime.format(d);                      // 'HH:MM'
-  const isoDate = `${yyyy}-${mm}-${dd}`;                   // 'YYYY-MM-DD' for DB
-  return { dateDDMMYYYY, timeHHMM, isoDate };
+// Local JSON fallback (if Supabase missing/unavailable)
+const FALLBACK_FILE = path.join(__dirname, 'local_orders.json');
+function readLocal() {
+  try { return JSON.parse(fs.readFileSync(FALLBACK_FILE, 'utf8')); }
+  catch { return []; }
+}
+function writeLocal(arr) {
+  try { fs.writeFileSync(FALLBACK_FILE, JSON.stringify(arr, null, 2), 'utf8'); }
+  catch (e) { console.error('local fallback write error:', e.message); }
 }
 
-function pick(v, fallback=null) {
-  return (v === undefined || v === null || v === '') ? fallback : v;
+// ─────────────────────────────────────────────────────────────────────────────
+// Time helpers
+function fmtDateDDMMYYYY(d, tz) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-GB', { timeZone: tz, day: '2-digit', month: '2-digit', year: 'numeric' });
+    const parts = fmt.formatToParts(d);
+    const dd = parts.find(p => p.type === 'day')?.value || '01';
+    const mm = parts.find(p => p.type === 'month')?.value || '01';
+    const yy = parts.find(p => p.type === 'year')?.value || '1970';
+    return `${dd}/${mm}/${yy}`;
+  } catch {
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const yy = d.getUTCFullYear();
+    return `${dd}/${mm}/${yy}`;
+  }
+}
+function fmtHHMM(d, tz) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false });
+    return fmt.format(d);
+  } catch {
+    const hh = String(d.getUTCHours()).padStart(2,'0');
+    const mm = String(d.getUTCMinutes()).padStart(2,'0');
+    return `${hh}:${mm}`;
+  }
 }
 
-// Normalize to your 18 columns exactly (names must match Supabase table)
-function normalizeForTable(row = {}) {
-  return {
-    order_id:              String(row.order_id || '').trim(),
-
-    date:                  row.date || null,               // 'YYYY-MM-DD' OR 'DD/MM/YYYY' (adapter coerces)
-    time_ordered:          row.time_ordered || null,       // 'HH:MM' or 'HH:MM:SS'
-
-    customer_name:         pick(row.customer_name, null),
-    email:                 pick(row.email, null),
-    phone:                 pick(row.phone, null),
-
-    payment_status:        pick(row.payment_status, null), // 'approved' | 'pending' | 'rejected'
-    driver_name:           pick(row.driver_name, null),
-
-    driver_accepted_time:  row.driver_accepted_time || null,   // 'HH:MM'
-    driver_picked_time:    row.driver_picked_time   || null,
-    driver_delivered_time: row.driver_delivered_time|| null,
-
-    delivery_location:     pick(row.delivery_location, null),
-
-    product_price:         row.product_price ?? null,      // numeric
-    delivery_price:        row.delivery_price ?? null,     // numeric
-
-    type_chosen:           pick(row.type_chosen, null),    // Beans | Powder
-    roast_level:           pick(row.roast_level, null),    // Light | Medium | Dark
-    size:                  pick(row.size, null),           // e.g., 1000g
-    qty:                   (row.qty != null ? parseInt(row.qty, 10) : null)
-  };
+// ─────────────────────────────────────────────────────────────────────────────
+// Supabase helpers
+async function sbGetById(order_id) {
+  if (!HAS_SB) return null;
+  const { data, error } = await sb.from(TABLE).select('*').eq('order_id', order_id).limit(1).maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+async function sbUpsert(row) {
+  if (!HAS_SB) return;
+  const { error } = await sb.from(TABLE).upsert(row, { onConflict: 'order_id', returning: 'minimal' });
+  if (error) throw error;
 }
 
-// Merge phase-specific fields
-function applyPhase(baseRow, phase, opts = {}) {
-  const out = { ...baseRow };
-  const tz = opts.tz || 'Africa/Addis_Ababa';
-  const refStartMs = opts.createdAtMs || Date.now();
-  const nowParts = tzNowParts(tz);
-
-  switch (phase) {
-    case 'payment_confirmed': {
-      // ensure date/time_ordered present (from createdAt if provided)
-      const when = tzNowParts(tz, refStartMs);
-      if (!out.date) out.date = when.isoDate;
-      if (!out.time_ordered) out.time_ordered = when.timeHHMM;
-      if (!out.payment_status) out.payment_status = 'approved';
-      break;
-    }
-    case 'driver_accepted': {
-      if (!out.driver_accepted_time) out.driver_accepted_time = nowParts.timeHHMM;
-      break;
-    }
-    case 'driver_picked': {
-      if (!out.driver_picked_time) out.driver_picked_time = nowParts.timeHHMM;
-      break;
-    }
-    case 'delivered': {
-      if (!out.driver_delivered_time) out.driver_delivered_time = nowParts.timeHHMM;
-      break;
-    }
-    default:
-      // no-op
-      break;
+// ─────────────────────────────────────────────────────────────────────────────
+// Merge keeping existing values when incoming is null/undefined/empty
+function mergeKeep(oldRow, patch) {
+  const out = { ...(oldRow || {}) };
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined || v === null || v === '') continue;
+    out[k] = v;
   }
   return out;
 }
 
-// ----------------------- public API -----------------------
+// Normalize incoming values to DB row shape
+function normalize(orderObj = {}) {
+  // Numbers
+  const toNum = (x) => {
+    if (x === undefined || x === null || x === '') return null;
+    const n = Number(String(x).replace(/[^\d.]/g, ''));
+    return Number.isFinite(n) ? n : null;
+  };
 
-async function persist(row, phase, opts = {}) {
-  if (!row || !row.order_id) throw new Error('persist() requires row.order_id');
-  const tableRow = normalizeForTable(row);
-  const phased   = applyPhase(tableRow, phase, opts);
+  const row = {
+    order_id:            orderObj.order_id || null,
+    date:                orderObj.date || null,           // "DD/MM/YYYY"
+    time_ordered:        orderObj.time_ordered || null,   // "HH:MM"
+    customer_name:       orderObj.customer_name || null,
+    email:               orderObj.email || null,
+    phone:               orderObj.phone || null,
+    payment_status:      orderObj.payment_status || null, // e.g., 'approved'
+    driver_name:         orderObj.driver_name || null,
 
-  // Route to adapter
-  const data = await supabase.upsert(phased);
-  return { ok: true, order_id: data.order_id };
+    driver_accepted_time: orderObj.driver_accepted_time || null,
+    driver_picked_time:   orderObj.driver_picked_time   || null,
+    driver_delivered_time:orderObj.driver_delivered_time|| null,
+
+    delivery_location:   orderObj.delivery_location || null,
+    product_price:       toNum(orderObj.product_price),
+    delivery_price:      toNum(orderObj.delivery_price),
+    type_chosen:         orderObj.type_chosen || null,
+    roast_level:         orderObj.roast_level || null,
+    size:                orderObj.size || null,           // e.g., "250g"
+    qty:                 orderObj.qty !== undefined ? Number(orderObj.qty) : null,
+  };
+
+  return row;
 }
 
-async function fetchAllOrders(range = {}) {
-  // range: {fromDate: 'YYYY-MM-DD'|'DD/MM/YYYY', toDate: same}
-  return await supabase.fetchAll(range);
+// Ensure date/time_ordered exist for a new order (using createdAtMs or now)
+function ensureOrderTimestamp(row, opts = {}) {
+  const tz = opts.tz || 'Africa/Addis_Ababa';
+  const base = opts.createdAtMs ? new Date(opts.createdAtMs) : new Date();
+  if (!row.date)         row.date = fmtDateDDMMYYYY(base, tz);
+  if (!row.time_ordered) row.time_ordered = fmtHHMM(base, tz);
+  return row;
 }
 
-function escapeCSV(val) {
-  if (val === null || val === undefined) return '';
-  const s = String(val);
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
+// Phase-specific enrichments (15s silent windows are handled in index.js; here we only persist final states)
+function stampPhase(row, phase, opts = {}) {
+  const tz = opts.tz || 'Africa/Addis_Ababa';
+  const now = new Date();
+
+  if (phase === 'payment_confirmed') {
+    // nothing extra; index.js already ensures this runs after hold window
+    // we only guarantee date/time_ordered exist
+  } else if (phase === 'driver_accepted') {
+    row.driver_accepted_time = row.driver_accepted_time || fmtHHMM(now, tz);
+  } else if (phase === 'picked') {
+    row.driver_picked_time = row.driver_picked_time || fmtHHMM(now, tz);
+  } else if (phase === 'delivered') {
+    row.driver_delivered_time = row.driver_delivered_time || fmtHHMM(now, tz);
+  }
+  return row;
 }
 
-// CSV in your exact column order
-function toCSV(rows = []) {
-  const header = [
-    'order_id','date','time_ordered','customer_name','email','phone',
-    'payment_status','driver_name','driver_accepted_time','driver_picked_time','driver_delivered_time',
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC: persist
+/**
+ * @param {Object} orderObj - partial fields for the order row
+ * @param {('payment_confirmed'|'driver_accepted'|'picked'|'delivered')} phase
+ * @param {{ tz?: string, createdAtMs?: number }} opts
+ */
+async function persist(orderObj, phase = 'payment_confirmed', opts = {}) {
+  try {
+    if (!orderObj || !orderObj.order_id) throw new Error('persist(): missing order_id');
+    const id = orderObj.order_id;
+
+    // 1) Normalize incoming data
+    let incoming = normalize(orderObj);
+
+    // 2) Enforce timestamp fields for new rows
+    incoming = ensureOrderTimestamp(incoming, opts);
+
+    // 3) Add phase stamp
+    incoming = stampPhase(incoming, phase, opts);
+
+    // 4) Merge with existing (to avoid null-overwrites)
+    let merged = incoming;
+
+    if (HAS_SB) {
+      const existing = await sbGetById(id);
+      merged = mergeKeep(existing, incoming);
+      await sbUpsert(merged);
+      return { ok: true, where: 'supabase', order_id: id, phase };
+    }
+
+    // Fallback local file
+    const arr = readLocal();
+    const idx = arr.findIndex(r => r.order_id === id);
+    if (idx >= 0) {
+      arr[idx] = mergeKeep(arr[idx], incoming);
+    } else {
+      arr.push(incoming);
+    }
+    writeLocal(arr);
+    return { ok: true, where: 'local', order_id: id, phase };
+
+  } catch (e) {
+    console.error('persist error:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (Optional) helpers — used by /export or cleanup command modules
+
+async function exportOrdersCSV({ fromDate, toDate } = {}) {
+  // Returns { ok, csv }
+  try {
+    if (!HAS_SB) {
+      // export local fallback as CSV
+      const rows = readLocal();
+      const csv = toCSV(rows);
+      return { ok: true, csv, where: 'local' };
+    }
+
+    let q = sb.from(TABLE).select('*').order('date', { ascending: true }).order('time_ordered', { ascending: true });
+
+    if (fromDate) q = q.gte('date', fromDate); // expects 'DD/MM/YYYY' or adjust in caller
+    if (toDate)   q = q.lte('date', toDate);
+
+    const { data, error } = await q;
+    if (error) throw error;
+    return { ok: true, csv: toCSV(data || []), where: 'supabase' };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+async function pruneOrdersBefore(cutoffDateDDMMYYYY) {
+  // Dangerous! Ensure caller exports first.
+  try {
+    if (!HAS_SB) {
+      const rows = readLocal().filter(r => (r.date || '') >= cutoffDateDDMMYYYY);
+      writeLocal(rows);
+      return { ok: true, where: 'local', kept: rows.length };
+    }
+    const { error } = await sb
+      .from(TABLE)
+      .delete()
+      .lt('date', cutoffDateDDMMYYYY);
+    if (error) throw error;
+    return { ok: true, where: 'supabase' };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+async function pruneOrdersOlderThanDays(days = 90, tz = 'Africa/Addis_Ababa') {
+  // Converts to a DD/MM/YYYY cutoff in tz; then calls pruneOrdersBefore
+  const now = new Date();
+  const cutoffMs = now.getTime() - days * 24 * 60 * 60 * 1000;
+  const cutoff = fmtDateDDMMYYYY(new Date(cutoffMs), tz);
+  return pruneOrdersBefore(cutoff);
+}
+
+// CSV utility
+function toCSV(rows) {
+  const cols = [
+    'order_id','date','time_ordered','customer_name','email','phone','payment_status',
+    'driver_name','driver_accepted_time','driver_picked_time','driver_delivered_time',
     'delivery_location','product_price','delivery_price','type_chosen','roast_level','size','qty'
   ];
-
-  const lines = [header.join(',')];
-
-  for (const r of rows) {
-    // format date/time for CSV readability
-    let dateOut = '';
-    if (r.date) {
-      if (/^\d{4}-\d{2}-\d{2}$/.test(r.date)) {
-        const [Y,M,D] = r.date.split('-');
-        dateOut = `${D}/${M}/${Y}`; // DD/MM/YYYY
-      } else {
-        dateOut = r.date; // already human
-      }
-    }
-    const rowOut = [
-      r.order_id ?? '',
-      dateOut,
-      (r.time_ordered || '')?.toString().slice(0,5),      // HH:MM
-      r.customer_name ?? '',
-      r.email ?? '',
-      r.phone ?? '',
-      r.payment_status ?? '',
-      r.driver_name ?? '',
-      (r.driver_accepted_time || '')?.toString().slice(0,5),
-      (r.driver_picked_time   || '')?.toString().slice(0,5),
-      (r.driver_delivered_time|| '')?.toString().slice(0,5),
-      r.delivery_location ?? '',
-      r.product_price ?? '',
-      r.delivery_price ?? '',
-      r.type_chosen ?? '',
-      r.roast_level ?? '',
-      r.size ?? '',
-      (r.qty ?? '').toString()
-    ].map(escapeCSV);
-
-    lines.push(rowOut.join(','));
-  }
-
-  return lines.join('\n');
+  const esc = (v) => {
+    if (v === null || v === undefined) return '';
+    const s = String(v);
+    if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const header = cols.join(',');
+  const lines = (rows || []).map(r => cols.map(c => esc(r[c])).join(','));
+  return [header, ...lines].join('\n');
 }
 
-async function health() {
-  return await supabase.health();
-}
-
+// ─────────────────────────────────────────────────────────────────────────────
 module.exports = {
   persist,
-  fetchAllOrders,
-  toCSV,
-  health
+  // optional helpers (used by export/cleanup command file, if you add it)
+  exportOrdersCSV,
+  pruneOrdersBefore,
+  pruneOrdersOlderThanDays,
 };
