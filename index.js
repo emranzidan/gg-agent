@@ -23,7 +23,7 @@ extractRef
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Paths
-const ROOT          = \_\_dirname;
+const ROOT = __dirname;
 const FEATURES\_FILE = path.join(ROOT, 'features.json');
 const MESSAGES\_FILE = path.join(ROOT, 'messages.json');
 const DRIVERS\_FILE  = path.join(ROOT, 'drivers.json');
