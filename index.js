@@ -489,29 +489,31 @@ bot.on('text', async (ctx, next) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────────
-// NEW: Intake capture middleware (non-invasive, runs before flows)
-// Saves: order_id, date/time, email, phone, type, size, roast, prices, total, location.
+// NEW: Intake capture middleware (fixed: call next() only once)
 bot.on('text', async (ctx, next) => {
   try {
     const txt = String(ctx.message?.text || '');
-    if (!txt || txt.length < 20) return (typeof next === 'function' ? next() : undefined);
 
-    // If it looks like an order summary, capture it once.
-    if (isOrderSummaryStrict(txt) || /Order ID:\s*GG-/i.test(txt)) {
-      const parsed = parseOrderFields(txt) || {};
-      const fields  = mapFieldsFromSummary(parsed, txt);
-      fields.order_id = extractRef(txt) || parsed.ref || ''; // GG-...
-      if (fields.order_id) {
-        await store.saveOrderIntake(fields, ctx).catch(e => console.warn('saveOrderIntake error:', e.message));
+    // Only process if it’s a real summary-length message
+    if (txt && txt.length >= 20) {
+      if (isOrderSummaryStrict(txt) || /Order ID:\s*GG-/i.test(txt)) {
+        const parsed = parseOrderFields(txt) || {};
+        const fields  = mapFieldsFromSummary(parsed, txt);
+        fields.order_id = extractRef(txt) || parsed.ref || ''; // GG-...
+        if (fields.order_id) {
+          await store.saveOrderIntake(fields, ctx).catch(e =>
+            console.warn('saveOrderIntake error:', e.message)
+          );
+        }
       }
     }
   } catch (e) {
     console.warn('intake middleware error:', e.message);
-  } finally {
-    if (typeof next === 'function') return next();
   }
-});
 
+  // Call next ONCE, here.
+  return (typeof next === 'function' ? next() : undefined);
+});
 // Drivers CRUD (+ persistence helpers)
 bot.command('adddriver', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
