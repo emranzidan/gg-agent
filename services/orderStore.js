@@ -1,16 +1,242 @@
-// services/orderStore.js — save intake, approve, driver times, CSV export & clear
-// EMMA PRO MAX — FINAL
+// services/orderStore.js — EMMA PRO MAX (final)
+// Single source of truth for: intake saves, payment status, driver events,
+// export CSV, clear+archive. Idempotent, RLS-safe (service-role), null-safe.
+
 'use strict';
 
-const { on, upsert, patch, selectAll, delAll, insert } = require('./db');
+const { createClient } = require('@supabase/supabase-js');
 
-const TABLE      = (process.env.SUPABASE_TABLE || 'orders').trim();
-const ARCHIVE    = (process.env.SUPABASE_TABLE_ARCHIVE || 'orders_archive').trim();
-const TZ         = 'Africa/Addis_Ababa';
+// ────────────────────────────────────────────────────────────────────────────────
+// ENV & Client
+const SUPABASE_URL =
+  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+// Prefer service-role; fall back to legacy var if present (but service-role is recommended)
+const SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_SERVICE_KEY ||
+  process.env.SUPABASE_ANON_KEY || '';
 
-/* ─────────────────────────── helpers ─────────────────────────── */
+const TABLE_ORDERS  = process.env.SUPABASE_TABLE || 'orders';
+const TABLE_ARCHIVE = process.env.SUPABASE_TABLE_ARCHIVE || 'orders_archive';
 
-const COLS = [
+// Note: Keep RLS ON in Supabase and use SERVICE_ROLE key here.
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.warn('[db] Supabase: OFF (missing URL or KEY)');
+}
+const supabase = (SUPABASE_URL && SUPABASE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_KEY, {
+      auth: { persistSession: false },
+      global: { headers: { 'x-gg-agent': 'emma-pro-max' } },
+    })
+  : null;
+
+if (supabase) console.log('[db] Supabase: ON');
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Helpers
+
+const TZ_FALLBACK = 'Africa/Addis_Ababa';
+
+const toNull = (v) =>
+  (v === undefined || v === null || (typeof v === 'string' && v.trim() === ''))
+    ? null
+    : v;
+
+const moneyOrNull = (v) => {
+  if (v === undefined || v === null) return null;
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string') {
+    const n = Number(v.replace(/[^\d.-]/g, ''));
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+};
+
+const clampIntOrNull = (v) => {
+  if (v === undefined || v === null || v === '') return null;
+  const n = parseInt(String(v).replace(/[^\d-]/g, ''), 10);
+  return Number.isFinite(n) ? n : null;
+};
+
+function localParts(ms = Date.now(), tz = TZ_FALLBACK) {
+  try {
+    const d = new Date(ms);
+    const fmtDate = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+    const fmtTime = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    const [y, m, d2] = fmtDate.format(d).split('-');
+    // Some locales insert NBSP; normalize
+    const t = fmtTime.format(d).replace(/\u202F|\u00A0/g, ''); // HH:mm:ss
+    return { date: `${y}-${m}-${d2}`, time: t };
+  } catch {
+    // Fallback UTC+3 simple formatting
+    const t = new Date(ms);
+    const y = t.getUTCFullYear();
+    const m = String(t.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(t.getUTCDate()).padStart(2, '0');
+    const hh = String((t.getUTCHours() + 3) % 24).padStart(2, '0');
+    const mm = String(t.getUTCMinutes()).padStart(2, '0');
+    const ss = String(t.getUTCSeconds()).padStart(2, '0');
+    return { date: `${y}-${m}-${d}`, time: `${hh}:${mm}:${ss}` };
+  }
+}
+
+function csvEscape(val) {
+  if (val === null || val === undefined) return '';
+  const s = String(val);
+  // If contains comma, quote, or newline, wrap in quotes and escape quotes
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function rowsToCSV(rows, columns) {
+  const header = columns.join(',');
+  const body = rows.map((r) =>
+    columns.map((c) => csvEscape(r[c])).join(',')
+  );
+  return [header, ...body].join('\n');
+}
+
+async function selectAllPaged(table, columns, order = { column: 'created_at', asc: true }) {
+  const pageSize = 1000;
+  let from = 0;
+  let to = pageSize - 1;
+  let all = [];
+  // Paged fetch
+  for (;;) {
+    const q = supabase
+      .from(table)
+      .select(columns.join(','), { head: false })
+      .order(order.column, { ascending: order.asc })
+      .range(from, to);
+
+    const { data, error } = await q;
+    if (error) throw error;
+    const chunk = data || [];
+    all = all.concat(chunk);
+    if (chunk.length < pageSize) break;
+    from += pageSize;
+    to += pageSize;
+  }
+  return all;
+}
+
+async function insertArchiveRows(rows) {
+  if (!rows || rows.length === 0) return;
+  const batchSize = 1000;
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const batch = rows.slice(i, i + batchSize);
+    const { error } = await supabase.from(TABLE_ARCHIVE).insert(batch);
+    if (error) throw error;
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Public API
+
+/**
+ * saveOrderIntake(fields, ctx?)
+ * Idempotent upsert by order_id. Fills date/time if missing. Stores raw_text, chat_id if ctx present.
+ * Expected fields (strings allowed, null-safe):
+ *  order_id (required), customer_name, email, phone, type, size, roast_level, qty,
+ *  product_price, delivery_price, total, delivery_location, map_url, date, time_ordered
+ */
+async function saveOrderIntake(fields, ctx, opts = {}) {
+  if (!supabase) return;
+  const order_id = toNull(fields.order_id);
+  if (!order_id) return;
+
+  const tz = opts.tz || TZ_FALLBACK;
+  const nowMs = opts.nowMs || Date.now();
+  const parts = localParts(nowMs, tz);
+
+  const row = {
+    order_id,
+    date:          toNull(fields.date) || parts.date,
+    time_ordered:  toNull(fields.time_ordered) || parts.time,
+    customer_name: toNull(fields.customer_name),
+    email:         toNull(fields.email),
+    phone:         toNull(fields.phone),
+    type:          toNull(fields.type),
+    size:          toNull(fields.size),
+    roast_level:   toNull(fields.roast_level),
+    qty:           clampIntOrNull(fields.qty),
+    product_price: moneyOrNull(fields.product_price),
+    delivery_price: moneyOrNull(fields.delivery_price),
+    total:         moneyOrNull(fields.total),
+    delivery_location: toNull(fields.delivery_location),
+    map_url:       toNull(fields.map_url),
+    // Convenience metadata
+    chat_id:       ctx?.chat?.id ?? null,
+    raw_text:      toNull(ctx?.message?.text),
+    updated_at:    new Date(nowMs).toISOString(),
+  };
+
+  // Idempotent upsert by order_id
+  const { error } = await supabase
+    .from(TABLE_ORDERS)
+    .upsert(row, { onConflict: 'order_id' });
+
+  if (error) {
+    console.error('[db] upsert error', error);
+    throw error;
+  }
+}
+
+/**
+ * savePaymentStatus(order_id, status)
+ * status: 'pending' | 'approved' | 'rejected' | ...
+ */
+async function savePaymentStatus(order_id, status) {
+  if (!supabase || !order_id) return;
+  const { error } = await supabase
+    .from(TABLE_ORDERS)
+    .upsert({
+      order_id,
+      payment_status: toNull(status),
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'order_id' });
+
+  if (error) {
+    console.error('[db] payment_status error', error);
+    throw error;
+  }
+}
+
+/**
+ * saveDriverEvent(order_id, kind, driverName?)
+ * kind: 'accepted' | 'picked' | 'delivered'
+ * Sets the appropriate timestamp column; also stores driver_name if provided.
+ * Respects optional opts.tz / opts.whenMs.
+ */
+async function saveDriverEvent(order_id, kind, driverName, opts = {}) {
+  if (!supabase || !order_id) return;
+
+  const tz = opts.tz || TZ_FALLBACK;
+  const whenMs = opts.whenMs || Date.now();
+  const isoNow = new Date(whenMs).toISOString();
+
+  const patch = {
+    order_id,
+    updated_at: isoNow,
+  };
+  if (driverName) patch.driver_name = toNull(driverName);
+
+  if (kind === 'accepted') patch.driver_accepted_time = isoNow;
+  else if (kind === 'picked') patch.driver_picked_time = isoNow;
+  else if (kind === 'delivered') patch.driver_delivered_time = isoNow;
+
+  const { error } = await supabase
+    .from(TABLE_ORDERS)
+    .upsert(patch, { onConflict: 'order_id' });
+
+  if (error) {
+    console.error('[db] driver event error', error);
+    throw error;
+  }
+}
+
+// Columns used for CSV export (stable order)
+const EXPORT_COLUMNS = [
   'order_id',
   'date',
   'time_ordered',
@@ -20,235 +246,85 @@ const COLS = [
   'type',
   'size',
   'roast_level',
+  'qty',
   'product_price',
   'delivery_price',
   'total',
   'delivery_location',
+  'map_url',
   'payment_status',
   'driver_name',
   'driver_accepted_time',
   'driver_picked_time',
-  'driver_delivered_time'
+  'driver_delivered_time',
+  'created_at',
+  'updated_at',
 ];
 
-const esc = (v) => {
-  if (v == null) return '';
-  const s = String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-};
-
-const toNumber = (n) => {
-  if (n == null) return null;
-  const x = Number(String(n).replace(/[^\d.]/g, ''));
-  return Number.isFinite(x) ? x : null;
-};
-
-const nowISO = () => new Date().toISOString();
-
-const toLocalParts = (isoOrUnixSec) => {
-  let d;
-  if (!isoOrUnixSec) d = new Date();
-  else if (typeof isoOrUnixSec === 'number') d = new Date(isoOrUnixSec * 1000);
-  else d = new Date(isoOrUnixSec);
-
-  const date = d.toLocaleDateString('en-GB', { timeZone: TZ }); // 31/08/2025
-  const time = d.toLocaleTimeString('en-GB', {
-    timeZone: TZ,
-    hour12: false,
-    hour: '2-digit',
-    minute: '2-digit'
-  }); // 23:27
-  return { date, time };
-};
-
-const joinLocation = (fields) => {
-  const addr = (fields.delivery_location || fields.address || '').trim();
-  const map  = (fields.map_url || fields.map || '').trim();
-  if (addr && map) return `${addr} | ${map}`;
-  return addr || map || '';
-};
-
-const computeTotal = (product_price, qty, delivery_price, fallbackTotal) => {
-  const pp = toNumber(product_price);
-  const q  = toNumber(qty) || 1;
-  const dp = toNumber(delivery_price) || 0;
-  const t  = toNumber(fallbackTotal);
-  if (pp != null) return (pp * q) + dp;
-  if (t != null)  return t;
-  return null;
-};
-
-/* ─────────────────────────── base row builder ─────────────────────────── */
-
-function buildIntakeRow(fields, ctx) {
-  // fields can include: order_id/ref, customer_name, email, phone, type, size, roast_level,
-  // qty, product_price, delivery_price, total, delivery_location/address, map_url, raw_text
-  const order_id = fields.order_id || fields.ref || '';
-  const { date, time } = toLocalParts(ctx?.message?.date);
-  const product_price = toNumber(fields.product_price);
-  const delivery_price = toNumber(fields.delivery_price);
-  const qty = toNumber(fields.qty) || 1;
-  const total = computeTotal(product_price, qty, delivery_price, fields.total);
-
-  return {
-    order_id,
-    date,
-    time_ordered: time,
-    customer_name: (fields.customer_name || '').trim(),
-    email: (fields.email || '').trim(),
-    phone: (fields.phone || '').trim(),
-    type: (fields.type || '').trim(),
-    size: (fields.size || '').trim(),
-    roast_level: (fields.roast_level || '').trim(),
-    product_price,
-    delivery_price,
-    total,
-    delivery_location: joinLocation(fields),
-    payment_status: 'pending',
-    driver_name: '',
-    driver_accepted_time: '',
-    driver_picked_time: '',
-    driver_delivered_time: '',
-    created_at: nowISO(),
-    updated_at: nowISO()
-  };
-}
-
-/* ─────────────────────────── public API ─────────────────────────── */
-
 /**
- * Save order intake (first time we see the order message).
- * Fills: date, time_ordered, email, type, size, roast, prices, total, delivery_location.
- * Conflict target: order_id (unique).
- */
-async function saveOrderIntake(fields, ctx) {
-  if (!on()) return { disabled: true };
-  const row = buildIntakeRow(fields, ctx);
-  if (!row.order_id) {
-    console.warn('[store] saveOrderIntake called without order_id/ref');
-    return { error: new Error('order_id missing') };
-  }
-  return upsert(TABLE, row, 'order_id');
-}
-
-/**
- * Mark payment approved (or pending).
- * status: 'approved' | 'pending'
- */
-async function savePaymentStatus(order_id, status = 'approved') {
-  if (!on()) return { disabled: true };
-  if (!order_id) return { error: new Error('order_id missing') };
-  return patch(TABLE, { order_id }, {
-    payment_status: status,
-    updated_at: nowISO()
-  });
-}
-
-/**
- * Save / update driver info.
- * type: 'accepted' | 'picked' | 'delivered'
- * If tsISO not provided, uses now.
- */
-async function saveDriverEvent(order_id, type, driver_name = '', tsISO = null) {
-  if (!on()) return { disabled: true };
-  if (!order_id) return { error: new Error('order_id missing') };
-
-  const stamp = (tsISO || nowISO());
-  const patchObj = { updated_at: nowISO() };
-
-  if (driver_name) patchObj.driver_name = driver_name;
-
-  if (type === 'accepted') patchObj.driver_accepted_time = stamp;
-  else if (type === 'picked') patchObj.driver_picked_time = stamp;
-  else if (type === 'delivered') patchObj.driver_delivered_time = stamp;
-  else return { error: new Error('invalid driver event type') };
-
-  return patch(TABLE, { order_id }, patchObj);
-}
-
-/**
- * Build CSV string for all rows in TABLE.
- * Ensures all columns exist (empty if missing).
+ * exportAllCSV()
+ * Reads ALL rows from live table and returns a CSV string.
  */
 async function exportAllCSV() {
-  // If DB is off, still return header
-  if (!on()) return [COLS.join(',')].join('\n');
-
-  const { data, error } = await selectAll(TABLE);
-  if (error) {
-    console.error('[store] export select error', error);
-    // still return header
-    return [COLS.join(',')].join('\n');
-  }
-
-  const rows = Array.isArray(data) ? data : [];
-
-  const out = [COLS.join(',')];
-
-  for (const r of rows) {
-    // derive date/time if not stored
-    const dt = toLocalParts(r.created_at || r.updated_at || Date.now());
-    const line = [
-      r.order_id || '',
-      r.date || dt.date,
-      r.time_ordered || dt.time,
-      r.customer_name || '',
-      r.email || '',
-      r.phone || '',
-      r.type || '',
-      r.size || '',
-      r.roast_level || '',
-      r.product_price ?? '',
-      r.delivery_price ?? '',
-      (r.total ?? computeTotal(r.product_price, 1, r.delivery_price, r.total)) ?? '',
-      r.delivery_location || '',
-      r.payment_status || '',
-      r.driver_name || '',
-      r.driver_accepted_time || '',
-      r.driver_picked_time || '',
-      r.driver_delivered_time || ''
-    ].map(esc).join(',');
-    out.push(line);
-  }
-
-  return out.join('\n');
+  if (!supabase) return 'order_id\n'; // minimal header fallback
+  const rows = await selectAllPaged(TABLE_ORDERS, EXPORT_COLUMNS);
+  // Normalize types for CSV (null -> '', numeric stays numeric)
+  const normalized = rows.map((r) => {
+    const out = {};
+    for (const c of EXPORT_COLUMNS) {
+      const v = r[c];
+      if (v === null || v === undefined) { out[c] = ''; continue; }
+      if (typeof v === 'object' && v !== null && 'toString' in v) out[c] = String(v);
+      else out[c] = String(v);
+    }
+    return out;
+  });
+  return rowsToCSV(normalized, EXPORT_COLUMNS);
 }
 
 /**
- * Export everything, archive, then clear live table.
- * - Archives into ARCHIVE (best effort). If ARCHIVE is missing, export still works and we still clear.
- * - Returns CSV string (same as exportAllCSV).
+ * clearAndExportAllCSV()
+ * 1) Pull all rows from live table
+ * 2) Write them to archive table
+ * 3) Delete all rows from live table
+ * Returns CSV string of what was exported.
  */
 async function clearAndExportAllCSV() {
-  const csv = await exportAllCSV();
+  if (!supabase) return 'order_id\n';
+  // 1) fetch all
+  const rows = await selectAllPaged(TABLE_ORDERS, EXPORT_COLUMNS);
+  const csv = rowsToCSV(
+    rows.map((r) => {
+      const out = {};
+      for (const c of EXPORT_COLUMNS) out[c] = r[c] ?? '';
+      return out;
+    }),
+    EXPORT_COLUMNS
+  );
 
-  if (on()) {
-    try {
-      // try to archive current rows first
-      const { data } = await selectAll(TABLE);
-      if (Array.isArray(data) && data.length) {
-        try {
-          await insert(ARCHIVE, data);
-        } catch (e) {
-          console.warn('[store] archive insert failed (continuing):', e?.message || e);
-        }
-        // clear live
-        await delAll(TABLE);
-      }
-    } catch (e) {
-      console.error('[store] clear/export error (continuing):', e?.message || e);
-    }
+  if (!rows.length) return csv;
+
+  // 2) archive insert (best effort; throws on error)
+  await insertArchiveRows(rows);
+
+  // 3) delete all from live
+  const { error: delErr } = await supabase
+    .from(TABLE_ORDERS)
+    .delete()
+    .not('order_id', 'is', null);
+  if (delErr) {
+    console.error('[db] clear live orders error', delErr);
+    // We already archived; we won’t throw to avoid losing the CSV on bot side.
   }
 
   return csv;
 }
 
-/* ─────────────────────────── exports ─────────────────────────── */
-
+// ────────────────────────────────────────────────────────────────────────────────
 module.exports = {
   saveOrderIntake,
   savePaymentStatus,
-  saveDriverEvent,         // type: 'accepted' | 'picked' | 'delivered'
+  saveDriverEvent,
   exportAllCSV,
   clearAndExportAllCSV,
 };
