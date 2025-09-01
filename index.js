@@ -202,6 +202,16 @@ function t(key, vars = {}) {
   return s.replace(/\{([A-Z0-9_]+)\}/g, (_, k) => (k in vars ? String(vars[k]) : `{${k}}`));
 }
 
+// Canonical order ID helpers (prefer long GG-... from summary)
+function getCanonicalRef(s) {
+  const fromSummary = extractRef(s?.summary || '');
+  return fromSummary || s?.ref || '';
+}
+function ensureCanonRef(s) {
+  if (!s._canonRef) s._canonRef = getCanonicalRef(s);
+  return s._canonRef;
+}
+
 // Timers for driver window
 function setDriverTimer(ref) {
   const s = Session.getSessionByRef(ref); if (!s) return;
@@ -238,7 +248,7 @@ async function postSheets(event, data = {}) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-// SILENT WINDOWS (driver 15s) — schedule external effects after UNDO window
+/** SILENT WINDOWS (driver 15s) — schedule external effects after UNDO window */
 const UNDO_SECS = 15;
 const openUndos = new Map();     // key = `${ref}:${action}:${driverId}` -> expiresAt (ms)
 const pendingFx = new Map();     // key -> timeout handle
@@ -304,31 +314,43 @@ async function showAcceptDeclineToDriver(s, driverId) {
   } catch {}
 }
 
-// Accept → external effects (after 15s if not undone)
+// Accept → external effects (after 15s if not undone) — write DB even if status moved on
 function scheduleAcceptEffects(ref, driverId) {
   scheduleFx(ref, 'accept', driverId, async () => {
     const s = Session.getSessionByRef(ref);
     if (!s) return;
-    if (s.assigned_driver_id !== driverId || s.status !== 'ASSIGNED') return;
-
+    const canonRef = ensureCanonRef(s);
     const d = drivers.get(driverId);
+
+    // DB time after 15s
+    try { await store.saveDriverEvent(canonRef, 'accepted', d ? d.name : ''); }
+    catch (e) { console.warn('store.accepted error', e.message); }
+
+    // Notices (same)
     if (STAFF_GROUP_ID) {
-      await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_accepted', {
-        REF: ref, DRIVER_NAME: d ? d.name : `id ${driverId}`, DRIVER_PHONE: d ? d.phone : '—', USER_ID: d ? d.id : driverId
-      })).catch(()=>{});
+      await bot.telegram.sendMessage(
+        STAFF_GROUP_ID,
+        t('staff.driver_accepted', {
+          REF: canonRef,
+          DRIVER_NAME: d ? d.name : `id ${driverId}`,
+          DRIVER_PHONE: d ? d.phone : '—',
+          USER_ID: d ? d.id : driverId
+        })
+      ).catch(()=>{});
     }
     const f = parseOrderFields(s.summary || '');
     if (s._customerId) {
-      await bot.telegram.sendMessage(s._customerId, t('customer.driver_assigned', {
-        REF: ref, DRIVER_NAME: d ? d.name : 'Assigned driver', DRIVER_PHONE: d ? d.phone : '—'
-      })).catch(()=>{});
+      await bot.telegram.sendMessage(
+        s._customerId,
+        t('customer.driver_assigned', {
+          REF: canonRef,
+          DRIVER_NAME: d ? d.name : 'Assigned driver',
+          DRIVER_PHONE: d ? d.phone : '—'
+        })
+      ).catch(()=>{});
     }
-
-    // NEW: persist driver accepted time
-    try { await store.saveDriverEvent(ref, 'accepted', d ? d.name : ''); } catch(e) { console.warn('store.accepted error', e.message); }
-
     await postSheets('assigned', {
-      ref,
+      ref: canonRef,
       customer_name: f.customerName || '',
       phone: f.phone || '',
       area: f.area || '',
@@ -344,36 +366,39 @@ function scheduleAcceptEffects(ref, driverId) {
   });
 }
 
-// Picked → external effects
+// Picked → external effects (write DB even if status moved)
 function schedulePickedEffects(ref, driverId) {
   scheduleFx(ref, 'picked', driverId, async () => {
     const s = Session.getSessionByRef(ref);
     if (!s) return;
-    if (s.assigned_driver_id !== driverId || s.status !== 'OUT_FOR_DELIVERY') return;
+    const canonRef = ensureCanonRef(s);
 
-    if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.picked_up', { REF: ref, USER_ID: driverId })).catch(()=>{});
-    if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.picked_up', { REF: ref })).catch(()=>{});
-
-    // NEW: persist driver picked time
+    // DB time after 15s
     const d = drivers.get(driverId);
-    try { await store.saveDriverEvent(ref, 'picked', d ? d.name : ''); } catch(e) { console.warn('store.picked error', e.message); }
+    try { await store.saveDriverEvent(canonRef, 'picked', d ? d.name : ''); }
+    catch (e) { console.warn('store.picked error', e.message); }
+
+    // Notices
+    if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.picked_up', { REF: canonRef, USER_ID: driverId })).catch(()=>{});
+    if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.picked_up', { REF: canonRef })).catch(()=>{});
   });
 }
 
-// Delivered → external effects (incl. persist)
+// Delivered → external effects (ensure row + times, using canonical id)
 function scheduleDeliveredEffects(ref, driverId) {
   scheduleFx(ref, 'delivered', driverId, async () => {
     const s = Session.getSessionByRef(ref);
     if (!s) return;
-    if (s.assigned_driver_id !== driverId || s.status !== 'DELIVERED') return;
+    const canonRef = ensureCanonRef(s);
 
-    if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.delivered', { REF: ref, USER_ID: driverId })).catch(()=>{});
-    if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.delivered', { REF: ref })).catch(()=>{});
+    // Notices
+    if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.delivered', { REF: canonRef, USER_ID: driverId })).catch(()=>{});
+    if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.delivered', { REF: canonRef })).catch(()=>{});
 
     const f3 = parseOrderFields(s.summary || '');
     const dInfo2 = drivers.get(driverId);
     await postSheets('delivered', {
-      ref,
+      ref: canonRef,
       customer_name: f3.customerName || '',
       phone: f3.phone || '',
       area: f3.area || '',
@@ -387,17 +412,16 @@ function scheduleDeliveredEffects(ref, driverId) {
       status: 'DELIVERED'
     });
 
-    // NEW: persist delivered time (+ ensure intake exists)
+    // DB: make sure intake exists + mark approved + delivered time (after 15s)
     try {
-      // ensure we have an intake row (idempotent upsert)
       const fields = mapFieldsFromSummary(f3, s.summary);
-      fields.order_id = ref;
-      await store.saveOrderIntake(fields); // no ctx: falls back to now if missing
-      await store.savePaymentStatus(ref, 'approved'); // final state
-      await store.saveDriverEvent(ref, 'delivered', dInfo2 ? dInfo2.name : '');
+      fields.order_id = canonRef;
+      await store.saveOrderIntake(fields);                 // idempotent upsert
+      await store.savePaymentStatus(canonRef, 'approved'); // final payment state
+      await store.saveDriverEvent(canonRef, 'delivered', dInfo2 ? dInfo2.name : '');
     } catch (e) {
       console.error('store(delivered) error', e);
-      if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${ref} (delivered)`).catch(()=>{});
+      if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${canonRef} (delivered)`).catch(()=>{});
     }
   });
 }
@@ -550,7 +574,6 @@ bot.command('drivers_export', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   const json = exportDriversJson();
   if (json.length > 3500) {
-    // FIX: chunk regex
     const chunks = json.match(/[\s\S]{1,3500}/g) || [json];
     await ctx.reply(`Current drivers JSON (${chunks.length} part(s)) — paste into drivers.json:`);
     for (const part of chunks) await ctx.reply(part);
@@ -870,12 +893,13 @@ async function finalizeApproval(s) {
       status: 'APPROVED'
     });
 
-    // EMMA: persist payment_confirmed → Supabase (idempotent)
+    // Persist payment_confirmed using canonical id (idempotent)
     try {
+      const canonRef = ensureCanonRef(s);
       const fields = mapFieldsFromSummary(f, s.summary);
-      fields.order_id = s.ref;
+      fields.order_id = canonRef;
       await store.saveOrderIntake(fields);                 // upsert intake row if missing
-      await store.savePaymentStatus(s.ref, 'approved');    // mark approved
+      await store.savePaymentStatus(canonRef, 'approved'); // mark approved
     } catch (e) {
       console.error('store(payment_confirmed) error', e);
       if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${s.ref} (payment_confirmed)`).catch(()=>{});
