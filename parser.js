@@ -16,9 +16,9 @@ function isLikelyQuestion(text) {
   const s = text.toLowerCase();
   if (s.includes('?')) return true;
   const triggers = [
-    'how', 'where', 'why', 'help', 'support', 'problem', 'issue',
-    'can you', 'please call', 'pls call', 'pls help',
-    'ረዳ', 'እርዳ', 'መርዳት', 'ረዳኝ'
+    'how','where','why','help','support','problem','issue',
+    'can you','please call','pls call','pls help',
+    'ረዳ','እርዳ','መርዳት','ረዳኝ'
   ];
   return triggers.some(w => s.includes(w));
 }
@@ -26,14 +26,10 @@ function isLikelyQuestion(text) {
 // Robustly pick the first GG reference (dash or underscore styles)
 function extractRef(text) {
   if (!text) return '';
-  // Try full dash style first: GG-YYYYMMDD-HHMMSS-XXXX
   const mDash = text.match(/(?:^|\s)(GG-\d{8}-\d{6}-[A-Z0-9_-]{3,})/i);
   if (mDash) return mDash[1];
-
-  // Fallback: any GG_ token up to whitespace/punct
   const mUnder = text.match(/(?:^|\s)(GG[_-][A-Z0-9][A-Z0-9_\-]*)/i);
   if (mUnder) return mUnder[1];
-
   return '';
 }
 
@@ -42,24 +38,23 @@ function isOrderSummaryStrict(text, opts = {}) {
   const s = String(text);
   const strictMode = !!(opts.strictMode ?? STRICT_DEFAULTS.strictMode);
   const minLen = Number(opts.minTextLength ?? STRICT_DEFAULTS.minTextLength);
-
   if (s.length < minLen) return false;
 
   const anchors = [
-    /GG-\d{8}-\d{6}-[A-Z0-9_-]{3,}/i,     // Dash ref
-    /GG[_-][A-Z0-9][A-Z0-9_\-]*/i,        // Underscore/loose ref
-    /Total:\s*ETB\s*[\d,]+/i,             // Total line
-    /Delivery\s*Fee:\s*ETB\s*[\d,]+/i,    // Delivery fee
-    /🫘\s*Roast:/i, /Roast:\s*[A-Za-z]/i,  // Any item block
-    /📞/i, /Phone:/i,                      // Phone
-    /https?:\/\/(?:www\.)?google\.com\/maps\//i, /place_id:/i, // Map
-    /📍\s*Address:/i, /Address:/i,        // Address
+    /GG-\d{8}-\d{6}-[A-Z0-9_-]{3,}/i,
+    /GG[_-][A-Z0-9][A-Z0-9_\-]*/i,
+    /Total:\s*ETB\s*[\d,]+/i,
+    /Delivery\s*Fee:\s*ETB\s*[\d,]+/i,
+    /\s*Roast:/i,
+    /Phone:/i,
+    /https?:\/\/(?:www\.)?google\.com\/maps\//i,
+    /place_id:/i,
+    /\s*Address:/i,
+    /Promo\s*Code:/i, // ✅ NEW anchor (creator program)
   ];
 
   let score = 0;
   for (const a of anchors) if (a.test(s)) score++;
-
-  // Strict requires at least 3 anchors, non-strict at least 2
   return score >= (strictMode ? 3 : 2);
 }
 
@@ -74,23 +69,15 @@ function toFloat(str) {
   const n = String(str).replace(/[^\d.]/g, '');
   return n ? parseFloat(n) : 0;
 }
-function safeTrim(s) {
-  return (s || '').toString().trim();
-}
+function safeTrim(s) { return (s || '').toString().trim(); }
 function splitLines(text) {
-  return String(text)
-    .replace(/\r/g, '')
-    .split('\n')
-    .map(s => s.trim())
-    .filter(Boolean);
+  return String(text).replace(/\r/g, '')
+    .split('\n').map(s => s.trim()).filter(Boolean);
 }
 function extractAfterEmojiOrLabel(lines, emoji, labelRegex) {
-  // Prefer emoji line, else labeled line.
   for (const line of lines) {
     const idx = line.indexOf(emoji);
-    if (idx >= 0) {
-      return line.slice(idx + emoji.length).replace(/^[:\-–\s]+/, '').trim();
-    }
+    if (idx >= 0) return line.slice(idx + emoji.length).replace(/^[:\-–\s]+/, '').trim();
   }
   for (const line of lines) {
     const m = line.match(labelRegex);
@@ -102,7 +89,6 @@ function extractAfterEmojiOrLabel(lines, emoji, labelRegex) {
   return '';
 }
 function extractGoogleMapsUrl(text) {
-  // Any google maps url, including place_id
   const url = text.match(/https?:\/\/(?:www\.)?google\.com\/maps\/[^\s)]+/i);
   if (url) return url[0];
   const place = text.match(/https?:\/\/(?:www\.)?google\.com\/maps\/place\/\?q=place_id:[^\s)]+/i);
@@ -118,99 +104,88 @@ function guessArea(address, pickup) {
   const p = safeTrim(pickup);
   return p || '—';
 }
-
-function leftPad2(n) { n = String(n); return n.length === 1 ? '0' + n : n; }
+function leftPad2(n){ n=String(n); return n.length===1 ? '0'+n : n; }
 function deriveDateTimeFromRef(ref) {
-  // Returns: { date_iso: 'YYYY-MM-DD', date: 'DD/MM/YYYY', time_hms: 'HH:MM:SS', time_ordered: 'HH:MM' } or nulls
-  if (!ref) return { date_iso: null, date: null, time_hms: null, time_ordered: null };
-
-  // GG-YYYYMMDD-HHMMSS-XXXX
+  if (!ref) return { date_iso:null, date:null, time_hms:null, time_ordered:null };
   let m = ref.match(/^GG-(\d{8})-(\d{6})-/i);
   if (m) {
-    const y = m[1].slice(0,4), M = m[1].slice(4,6), d = m[1].slice(6,8);
-    const hh = m[2].slice(0,2), mm = m[2].slice(2,4), ss = m[2].slice(4,6);
-    return {
-      date_iso: `${y}-${M}-${d}`,
-      date: `${d}/${M}/${y}`,
-      time_hms: `${hh}:${mm}:${ss}`,
-      time_ordered: `${hh}:${mm}`,
-    };
+    const y=m[1].slice(0,4), M=m[1].slice(4,6), d=m[1].slice(6,8);
+    const hh=m[2].slice(0,2), mm=m[2].slice(2,4), ss=m[2].slice(4,6);
+    return { date_iso:`${y}-${M}-${d}`, date:`${d}/${M}/${y}`, time_hms:`${hh}:${mm}:${ss}`, time_ordered:`${hh}:${mm}` };
   }
-
-  // GG_*_YYYYMMDD_HHMM (e.g., GG_TEST_20250831_1952) or GG_*_YYYYMMDDHHMM
   m = ref.match(/(\d{8})[_-]?(\d{4,6})$/);
   if (m) {
-    const y = m[1].slice(0,4), M = m[1].slice(4,6), d = m[1].slice(6,8);
-    const hh = m[2].slice(0,2), mm = m[2].slice(2,4), ss = m[2].length === 6 ? m[2].slice(4,6) : '00';
-    return {
-      date_iso: `${y}-${M}-${d}`,
-      date: `${d}/${M}/${y}`,
-      time_hms: `${hh}:${mm}:${ss}`,
-      time_ordered: `${hh}:${mm}`,
-    };
+    const y=m[1].slice(0,4), M=m[1].slice(4,6), d=m[1].slice(6,8);
+    const hh=m[2].slice(0,2), mm=m[2].slice(2,4), ss=m[2].length===6 ? m[2].slice(4,6) : '00';
+    return { date_iso:`${y}-${M}-${d}`, date:`${d}/${M}/${y}`, time_hms:`${hh}:${mm}:${ss}`, time_ordered:`${hh}:${mm}` };
   }
+  return { date_iso:null, date:null, time_hms:null, time_ordered:null };
+}
 
-  return { date_iso: null, date: null, time_hms: null, time_ordered: null };
+// -------------------- PROMO parser (NEW) --------------------
+function parsePromo(rawText){
+  const text = String(rawText || '');
+
+  // Accept:
+  // "🏷️ Promo Code: tinsu17 (5% OFF)"
+  // "Promo Code: tinsu17 (5% OFF)"
+  // Also tolerate extra spaces
+  const m = text.match(/Promo\s*Code:\s*([^\n(]+)\s*\((\d+)\s*%\s*OFF\)/i);
+  if (!m) return { promo_code: '', promo_pct: 0 };
+
+  const promo_code = safeTrim(m[1]);
+  const promo_pct = Number(m[2] || 0) || 0;
+
+  return { promo_code, promo_pct };
 }
 
 // -------------------- items parser --------------------
 function extractItems(lines) {
   const items = [];
   let cur = null;
-
-  function ensureItem() {
-    if (!cur) cur = { roast: '', type: '', size_g: 0, qty: 0, unit_price: 0, line_total: 0 };
-  }
-  function pushIfFilled() {
-    if (!cur) return;
-    const touched = cur.roast || cur.type || cur.size_g || cur.qty || cur.unit_price || cur.line_total;
-    if (touched) items.push({ ...cur });
-    cur = null;
+  function ensureItem(){ if(!cur) cur={ roast:'', type:'', size_g:0, qty:0, unit_price:0, line_total:0 }; }
+  function pushIfFilled(){
+    if(!cur) return;
+    const touched = cur.roast||cur.type||cur.size_g||cur.qty||cur.unit_price||cur.line_total;
+    if(touched) items.push({ ...cur });
+    cur=null;
   }
 
-  for (let i = 0; i < lines.length; i++) {
+  for (let i=0;i<lines.length;i++){
     const L = lines[i];
 
-    // New item often starts at Roast
-    if (/🫘\s*Roast:/i.test(L) || /^Roast:/i.test(L)) {
-      pushIfFilled();
-      ensureItem();
-      const m = L.match(/Roast:\s*([A-Za-z]+)/i);
-      if (m) cur.roast = m[1];
+    if (/\s*Roast:/i.test(L) || /^Roast:/i.test(L)){
+      pushIfFilled(); ensureItem();
+      const m=L.match(/Roast:\s*([A-Za-z]+)/i);
+      if(m) cur.roast=m[1];
       continue;
     }
-
-    if (/🧂\s*Type:/i.test(L) || /^Type:/i.test(L)) {
+    if (/\s*Type:/i.test(L) || /^Type:/i.test(L)){
       ensureItem();
-      const m = L.match(/Type:\s*([A-Za-z]+)/i);
-      if (m) cur.type = m[1];
+      const m=L.match(/Type:\s*([A-Za-z]+)/i);
+      if(m) cur.type=m[1];
       continue;
     }
-
-    if (/⚖️\s*Size:/i.test(L) || /^Size:/i.test(L)) {
+    if (/⚖️\s*Size:/i.test(L) || /^Size:/i.test(L)){
       ensureItem();
-      // e.g., Size: 250 g, 1000 g, 250g
-      const m = L.match(/Size:\s*([\d.,]+)\s*g/i);
-      if (m) cur.size_g = Math.round(parseFloat(m[1].replace(',', '.')));
+      const m=L.match(/Size:\s*([\d.,]+)\s*g/i);
+      if(m) cur.size_g=Math.round(parseFloat(m[1].replace(',', '.')));
       continue;
     }
-
-    if (/🔢\s*Qty:/i.test(L) || /^Qty:/i.test(L)) {
+    if (/\s*Qty:/i.test(L) || /^Qty:/i.test(L)){
       ensureItem();
-      const m = L.match(/Qty:\s*(\d+)/i);
-      if (m) cur.qty = parseInt(m[1], 10);
+      const m=L.match(/Qty:\s*(\d+)/i);
+      if(m) cur.qty=parseInt(m[1],10);
       continue;
     }
-
-    if (/💸/i.test(L) || /ETB/i.test(L)) {
-      // 💸 ETB 2125 x 2 = ETB 4250
+    if (/ETB/i.test(L)){
       ensureItem();
-      const unit = L.match(/ETB\s*([\d,]+)\s*(?:x|×)?/i);
-      const qty  = L.match(/x\s*(\d+)/i);
-      const line = L.match(/=\s*ETB\s*([\d,]+)/i);
-      if (unit) cur.unit_price = cleanMoney(unit[1]);
-      if (qty)  cur.qty = cur.qty || parseInt(qty[1], 10);
-      if (line) cur.line_total = cleanMoney(line[1]);
+      const unit=L.match(/ETB\s*([\d,]+)\s*(?:x|×)?/i);
+      const qty=L.match(/x\s*(\d+)/i);
+      const line=L.match(/=\s*ETB\s*([\d,]+)/i);
+      if(unit) cur.unit_price=cleanMoney(unit[1]);
+      if(qty) cur.qty=cur.qty||parseInt(qty[1],10);
+      if(line) cur.line_total=cleanMoney(line[1]);
       continue;
     }
   }
@@ -218,17 +193,12 @@ function extractItems(lines) {
   pushIfFilled();
   return items;
 }
-
-function choosePrimaryItem(items) {
-  if (!items || !items.length) return null;
-  // Sort by qty desc, then line_total desc, then size_g desc
-  const sorted = [...items].sort((a, b) => {
-    const qa = Number(a.qty || 0), qb = Number(b.qty || 0);
-    if (qb !== qa) return qb - qa;
-    const la = Number(a.line_total || 0), lb = Number(b.line_total || 0);
-    if (lb !== la) return lb - la;
-    const sa = Number(a.size_g || 0), sb = Number(b.size_g || 0);
-    return sb - sa;
+function choosePrimaryItem(items){
+  if(!items||!items.length) return null;
+  const sorted=[...items].sort((a,b)=>{
+    const qa=Number(a.qty||0), qb=Number(b.qty||0); if(qb!==qa) return qb-qa;
+    const la=Number(a.line_total||0), lb=Number(b.line_total||0); if(lb!==la) return lb-la;
+    const sa=Number(a.size_g||0), sb=Number(b.size_g||0); return sb-sa;
   });
   return sorted[0];
 }
@@ -236,16 +206,13 @@ function choosePrimaryItem(items) {
 // -------------------- main parser --------------------
 function parseOrderFields(text, opts = {}) {
   const minLen = Number(opts.minTextLength ?? STRICT_DEFAULTS.minTextLength);
-  if (!text || text.length < minLen) {
-    return { ok: false, reason: 'too_short' };
-  }
+  if (!text || text.length < minLen) return { ok:false, reason:'too_short' };
 
-  const raw   = String(text);
+  const raw = String(text);
   const lines = splitLines(raw);
 
   const ref = extractRef(raw);
 
-  // Monetary & numeric fields
   const totalM = raw.match(/Total:\s*ETB\s*([\d,]+)/i);
   const total = totalM ? cleanMoney(totalM[1]) : 0;
 
@@ -255,16 +222,10 @@ function parseOrderFields(text, opts = {}) {
   const distM = raw.match(/Distance:\s*([\d.]+)\s*km/i);
   const distance_km = distM ? toFloat(distM[1]) : 0;
 
-  const pickup = extractAfterEmojiOrLabel(
-    lines,
-    '🏪',
-    /^(?:Pickup|Pick\s*up|Store|Hub):/i
-  );
+  const pickup = extractAfterEmojiOrLabel(lines, '', /^(?:Pickup|Pick\s*up|Store|Hub):/i);
+  const customerName = extractAfterEmojiOrLabel(lines, '', /^(?:Customer|Name):/i);
 
-  const customerName = extractAfterEmojiOrLabel(lines, '👤', /^(?:Customer|Name):/i);
-
-  // Phone: prefer "📞 ..." line; else any phone-ish pattern
-  let phone = extractAfterEmojiOrLabel(lines, '📞', /^(?:Phone|Tel|Mobile):/i);
+  let phone = extractAfterEmojiOrLabel(lines, '', /^(?:Phone|Tel|Mobile):/i);
   if (!phone) {
     const m = raw.match(/(\+?\d[\d\s().\-]{6,})/);
     phone = m ? m[1].trim() : '';
@@ -273,51 +234,54 @@ function parseOrderFields(text, opts = {}) {
   const emailMatch = raw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   const email = emailMatch ? emailMatch[0] : '';
 
-  const address = extractAfterEmojiOrLabel(lines, '📍', /^(?:Address|Location):/i);
+  const address = extractAfterEmojiOrLabel(lines, '', /^(?:Address|Location):/i);
   const map = extractGoogleMapsUrl(raw);
 
-  // Items + top-level (dominant) fields for compatibility
   const items = extractItems(lines);
   const qty = items.reduce((sum, it) => sum + (Number(it.qty) || 0), 0);
-
   const primary = choosePrimaryItem(items);
-  const type  = primary?.type  || '';
-  const roast = primary?.roast || '';
-  // top-level size as a friendly string (e.g., "1000g")
-  const size  = primary?.size_g ? `${primary.size_g}g` : '';
 
+  const type = primary?.type || '';
+  const roast = primary?.roast || '';
+  const size = primary?.size_g ? `${primary.size_g}g` : '';
   const area = guessArea(address, pickup);
 
-  // Optional date/time derivation from ref
   const { date_iso, date, time_hms, time_ordered } = deriveDateTimeFromRef(ref);
+
+  // ✅ PROMO
+  const promo = parsePromo(raw);
 
   return {
     ok: true,
     ref,
-    // order figures
+
     total,
     delivery,
     distance_km,
     pickup,
-    // identity & location
+
     customerName: safeTrim(customerName),
     phone: safeTrim(phone),
     email: safeTrim(email),
     address: safeTrim(address),
     map: safeTrim(map) || '',
     area,
-    // items
+
     items,
     qty,
-    // convenient single-item style (dominant)
+
     type,
     roast,
     size,
-    // derived timestamps (non-breaking extras)
-    date_iso,       // "YYYY-MM-DD"
-    date,           // "DD/MM/YYYY"
-    time_hms,       // "HH:MM:SS"
-    time_ordered,   // "HH:MM"
+
+    date_iso,
+    date,
+    time_hms,
+    time_ordered,
+
+    // ✅ NEW FIELDS
+    promo_code: promo.promo_code || '',
+    promo_pct: promo.promo_pct || 0,
   };
 }
 
