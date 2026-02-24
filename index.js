@@ -8,8 +8,7 @@ try { liveOrdersRoutes = require("./routes/liveOrdersRoutes"); } catch (e) { liv
 
 // other existing content of index.js 
 
-if (f.customerName) card = `👤 ${f.customerName}\n` + card;
-if (f.phone) card += `\n📞 ${f.phone}`;
+
 
 // ===== LIVE FEED (Dashboard API) — CAPTURE ORDER (do not edit) =====
 try {
