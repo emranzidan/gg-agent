@@ -1194,3 +1194,59 @@ function watchFile(fp, onChange) {
     console.warn('[hot] watcher failed for', fp, e.message);
   }
 }
+// ================== RENDER WEB SERVER (DO NOT REMOVE) ==================
+try {
+  const http = require("http");
+  const PORT = Number(process.env.PORT || 3000);
+
+  // Safe getter for live orders (supports different export names)
+  function getLiveOrdersSafe() {
+    try {
+      const feed = liveOrderFeed || null;
+      if (!feed) return [];
+      const fn =
+        feed.getLiveOrders ||
+        feed.getOrders ||
+        feed.list ||
+        feed.snapshot ||
+        feed.getSnapshot ||
+        feed.dump ||
+        null;
+      if (typeof fn === "function") return fn.call(feed) || [];
+      if (Array.isArray(feed.orders)) return feed.orders;
+      if (Array.isArray(feed._orders)) return feed._orders;
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  const server = http.createServer((req, res) => {
+    // CORS for your new dashboard app
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
+
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      return res.end("ok");
+    }
+
+    if (req.url === "/api/live-orders") {
+      const data = getLiveOrdersSafe();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, count: data.length, orders: data }));
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: false, error: "Not found" }));
+  });
+
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`[web] listening on ${PORT}`);
+  });
+} catch (e) {
+  console.log("[web] failed to start:", e?.message || e);
+}
+// =======================================================================
