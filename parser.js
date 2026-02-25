@@ -74,20 +74,39 @@ function splitLines(text) {
   return String(text).replace(/\r/g, '')
     .split('\n').map(s => s.trim()).filter(Boolean);
 }
+
+// ✅ FIX: emoji='' was breaking everything because ''.indexOf('') is always 0.
+// New behavior:
+// - only do emoji search if emoji is a non-empty string
+// - always run labelRegex against a "cleaned" line (strips leading emojis/bullets)
+function stripLeadingNonText(line) {
+  // Remove leading emojis/bullets/spaces while keeping letters/numbers/+ intact
+  return String(line || '').replace(/^[^A-Za-z0-9+]+/, '').trim();
+}
 function extractAfterEmojiOrLabel(lines, emoji, labelRegex) {
-  for (const line of lines) {
-    const idx = line.indexOf(emoji);
-    if (idx >= 0) return line.slice(idx + emoji.length).replace(/^[:\-–\s]+/, '').trim();
-  }
-  for (const line of lines) {
-    const m = line.match(labelRegex);
-    if (m) {
-      const i = (m.index ?? 0) + m[0].length;
-      return line.slice(i).replace(/^[:\-–\s]+/, '').trim();
+  const emo = (typeof emoji === 'string' && emoji.length > 0) ? emoji : null;
+
+  if (emo) {
+    for (const line of lines) {
+      const idx = line.indexOf(emo);
+      if (idx >= 0) return line.slice(idx + emo.length).replace(/^[:\-–\s]+/, '').trim();
     }
   }
+
+  if (labelRegex) {
+    for (const line of lines) {
+      const cleaned = stripLeadingNonText(line);
+      const m = cleaned.match(labelRegex);
+      if (m) {
+        const i = (m.index ?? 0) + m[0].length;
+        return cleaned.slice(i).replace(/^[:\-–\s]+/, '').trim();
+      }
+    }
+  }
+
   return '';
 }
+
 function extractGoogleMapsUrl(text) {
   const url = text.match(/https?:\/\/(?:www\.)?google\.com\/maps\/[^\s)]+/i);
   if (url) return url[0];
@@ -95,6 +114,7 @@ function extractGoogleMapsUrl(text) {
   if (place) return place[0];
   return '';
 }
+
 function guessArea(address, pickup) {
   const a = safeTrim(address);
   if (a) {
@@ -104,7 +124,9 @@ function guessArea(address, pickup) {
   const p = safeTrim(pickup);
   return p || '—';
 }
+
 function leftPad2(n){ n=String(n); return n.length===1 ? '0'+n : n; }
+
 function deriveDateTimeFromRef(ref) {
   if (!ref) return { date_iso:null, date:null, time_hms:null, time_ordered:null };
   let m = ref.match(/^GG-(\d{8})-(\d{6})-/i);
@@ -129,7 +151,6 @@ function parsePromo(rawText){
   // Accept:
   // "🏷️ Promo Code: tinsu17 (5% OFF)"
   // "Promo Code: tinsu17 (5% OFF)"
-  // Also tolerate extra spaces
   const m = text.match(/Promo\s*Code:\s*([^\n(]+)\s*\((\d+)\s*%\s*OFF\)/i);
   if (!m) return { promo_code: '', promo_pct: 0 };
 
@@ -203,6 +224,26 @@ function choosePrimaryItem(items){
   return sorted[0];
 }
 
+// -------------------- sanity helpers --------------------
+function looksLikePhone(s) {
+  const x = safeTrim(s);
+  if (!x) return false;
+  const digits = x.replace(/[^\d]/g, '');
+  if (digits.length < 7) return false;
+  if (/[A-Za-z]/.test(x)) return false;
+  if (/GG[-_]/i.test(x)) return false;
+  if (/Order\s*ID/i.test(x)) return false;
+  return true;
+}
+function normalizeName(s) {
+  const x = safeTrim(s);
+  if (!x) return '';
+  if (/GG[-_]/i.test(x)) return '';
+  if (/Order\s*ID/i.test(x)) return '';
+  if (x.length > 120) return '';
+  return x;
+}
+
 // -------------------- main parser --------------------
 function parseOrderFields(text, opts = {}) {
   const minLen = Number(opts.minTextLength ?? STRICT_DEFAULTS.minTextLength);
@@ -222,19 +263,25 @@ function parseOrderFields(text, opts = {}) {
   const distM = raw.match(/Distance:\s*([\d.]+)\s*km/i);
   const distance_km = distM ? toFloat(distM[1]) : 0;
 
-  const pickup = extractAfterEmojiOrLabel(lines, '', /^(?:Pickup|Pick\s*up|Store|Hub):/i);
-  const customerName = extractAfterEmojiOrLabel(lines, '', /^(?:Customer|Name):/i);
+  // ✅ use labelRegex with emoji-safe extraction
+  const pickup = extractAfterEmojiOrLabel(lines, null, /^(?:Pickup|Pick\s*up|Store|Hub):/i);
 
-  let phone = extractAfterEmojiOrLabel(lines, '', /^(?:Phone|Tel|Mobile):/i);
-  if (!phone) {
+  // Name: tolerate "Customer:" OR "Name:"
+  const customerNameRaw = extractAfterEmojiOrLabel(lines, null, /^(?:Customer|Name):/i);
+
+  // Phone: tolerate "Phone:" OR "Tel:" OR "Mobile:"
+  let phoneRaw = extractAfterEmojiOrLabel(lines, null, /^(?:Phone|Tel|Mobile):/i);
+
+  // If labeled phone looks wrong, fallback to numeric scan
+  if (!looksLikePhone(phoneRaw)) {
     const m = raw.match(/(\+?\d[\d\s().\-]{6,})/);
-    phone = m ? m[1].trim() : '';
+    phoneRaw = m ? m[1].trim() : '';
   }
 
   const emailMatch = raw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   const email = emailMatch ? emailMatch[0] : '';
 
-  const address = extractAfterEmojiOrLabel(lines, '', /^(?:Address|Location):/i);
+  const address = extractAfterEmojiOrLabel(lines, null, /^(?:Address|Location):/i);
   const map = extractGoogleMapsUrl(raw);
 
   const items = extractItems(lines);
@@ -260,8 +307,8 @@ function parseOrderFields(text, opts = {}) {
     distance_km,
     pickup,
 
-    customerName: safeTrim(customerName),
-    phone: safeTrim(phone),
+    customerName: normalizeName(customerNameRaw),
+    phone: safeTrim(phoneRaw),
     email: safeTrim(email),
     address: safeTrim(address),
     map: safeTrim(map) || '',
