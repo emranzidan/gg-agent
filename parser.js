@@ -1,8 +1,5 @@
 // parser.js — tolerant order detection & field extraction (Green Gold)
 // API: isLikelyQuestion, isOrderSummaryStrict, parseOrderFields, extractRef
-// Extracts from emoji-rich summaries and multiple ID styles.
-// Supports refs like "GG-20250831-235519-D1XB" and "GG_TEST_20250831_1952" and "GG_9JOW".
-
 'use strict';
 
 const STRICT_DEFAULTS = {
@@ -23,7 +20,6 @@ function isLikelyQuestion(text) {
   return triggers.some(w => s.includes(w));
 }
 
-// Robustly pick the first GG reference (dash or underscore styles)
 function extractRef(text) {
   if (!text) return '';
   const mDash = text.match(/(?:^|\s)(GG-\d{8}-\d{6}-[A-Z0-9_-]{3,})/i);
@@ -46,11 +42,10 @@ function isOrderSummaryStrict(text, opts = {}) {
     /Total:\s*ETB\s*[\d,]+/i,
     /Delivery\s*Fee:\s*ETB\s*[\d,]+/i,
     /\s*Roast:/i,
-    /Phone:/i,
     /https?:\/\/(?:www\.)?google\.com\/maps\//i,
     /place_id:/i,
     /\s*Address:/i,
-    /Promo\s*Code:/i, // ✅ NEW anchor (creator program)
+    /\bPromo\s*:/i,
   ];
 
   let score = 0;
@@ -75,14 +70,12 @@ function splitLines(text) {
     .split('\n').map(s => s.trim()).filter(Boolean);
 }
 
-// ✅ FIX: emoji='' was breaking everything because ''.indexOf('') is always 0.
-// New behavior:
-// - only do emoji search if emoji is a non-empty string
-// - always run labelRegex against a "cleaned" line (strips leading emojis/bullets)
+// Unicode-safe strip (keeps Amharic too)
 function stripLeadingNonText(line) {
-  // Remove leading emojis/bullets/spaces while keeping letters/numbers/+ intact
-  return String(line || '').replace(/^[^A-Za-z0-9+]+/, '').trim();
+  return String(line || '').replace(/^[^\p{L}\p{N}+]+/u, '').trim();
 }
+
+// ✅ if emoji is empty, skip emoji search
 function extractAfterEmojiOrLabel(lines, emoji, labelRegex) {
   const emo = (typeof emoji === 'string' && emoji.length > 0) ? emoji : null;
 
@@ -125,8 +118,6 @@ function guessArea(address, pickup) {
   return p || '—';
 }
 
-function leftPad2(n){ n=String(n); return n.length===1 ? '0'+n : n; }
-
 function deriveDateTimeFromRef(ref) {
   if (!ref) return { date_iso:null, date:null, time_hms:null, time_ordered:null };
   let m = ref.match(/^GG-(\d{8})-(\d{6})-/i);
@@ -135,29 +126,28 @@ function deriveDateTimeFromRef(ref) {
     const hh=m[2].slice(0,2), mm=m[2].slice(2,4), ss=m[2].slice(4,6);
     return { date_iso:`${y}-${M}-${d}`, date:`${d}/${M}/${y}`, time_hms:`${hh}:${mm}:${ss}`, time_ordered:`${hh}:${mm}` };
   }
-  m = ref.match(/(\d{8})[_-]?(\d{4,6})$/);
-  if (m) {
-    const y=m[1].slice(0,4), M=m[1].slice(4,6), d=m[1].slice(6,8);
-    const hh=m[2].slice(0,2), mm=m[2].slice(2,4), ss=m[2].length===6 ? m[2].slice(4,6) : '00';
-    return { date_iso:`${y}-${M}-${d}`, date:`${d}/${M}/${y}`, time_hms:`${hh}:${mm}:${ss}`, time_ordered:`${hh}:${mm}` };
-  }
   return { date_iso:null, date:null, time_hms:null, time_ordered:null };
 }
 
-// -------------------- PROMO parser (NEW) --------------------
+// -------------------- PROMO parser --------------------
+function normCode(c){ return safeTrim(c).toUpperCase(); }
+
 function parsePromo(rawText){
   const text = String(rawText || '');
 
-  // Accept:
-  // "🏷️ Promo Code: tinsu17 (5% OFF)"
-  // "Promo Code: tinsu17 (5% OFF)"
-  const m = text.match(/Promo\s*Code:\s*([^\n(]+)\s*\((\d+)\s*%\s*OFF\)/i);
-  if (!m) return { promo_code: '', promo_pct: 0 };
+  // "🏷️ Promo: CODE (5% OFF)" or "Promo: CODE (5% OFF)"
+  let m = text.match(/Promo\s*:\s*([^\n(]+)\s*\((\d+)\s*%\s*OFF\)/i);
+  if (m) return { promo_code: normCode(m[1]), promo_pct: Number(m[2] || 0) || 0 };
 
-  const promo_code = safeTrim(m[1]);
-  const promo_pct = Number(m[2] || 0) || 0;
+  // "Promo Code: CODE (5% OFF)"
+  m = text.match(/Promo\s*Code:\s*([^\n(]+)\s*\((\d+)\s*%\s*OFF\)/i);
+  if (m) return { promo_code: normCode(m[1]), promo_pct: Number(m[2] || 0) || 0 };
 
-  return { promo_code, promo_pct };
+  // "Order Details (Promo: CODE):" (allow trailing colon)
+  m = text.match(/Order\s*Details\s*\(Promo:\s*([^)]+)\)\s*:?/i);
+  if (m) return { promo_code: normCode(m[1]), promo_pct: 0 };
+
+  return { promo_code: '', promo_pct: 0 };
 }
 
 // -------------------- items parser --------------------
@@ -224,24 +214,76 @@ function choosePrimaryItem(items){
   return sorted[0];
 }
 
-// -------------------- sanity helpers --------------------
-function looksLikePhone(s) {
-  const x = safeTrim(s);
-  if (!x) return false;
-  const digits = x.replace(/[^\d]/g, '');
-  if (digits.length < 7) return false;
-  if (/[A-Za-z]/.test(x)) return false;
-  if (/GG[-_]/i.test(x)) return false;
-  if (/Order\s*ID/i.test(x)) return false;
-  return true;
-}
+// -------------------- name/phone extraction --------------------
 function normalizeName(s) {
-  const x = safeTrim(s);
+  const x = safeTrim(s).replace(/^["']|["']$/g, '');
   if (!x) return '';
   if (/GG[-_]/i.test(x)) return '';
   if (/Order\s*ID/i.test(x)) return '';
   if (x.length > 120) return '';
   return x;
+}
+
+function looksLikeRealPhone(s) {
+  const x = safeTrim(s);
+  if (!x) return false;
+  if (/[A-Za-z]/.test(x)) return false;
+
+  const digits = x.replace(/[^\d]/g, '');
+  if (digits.length < 9 || digits.length > 15) return false;
+
+  // Accept formats:
+  // +251..., 251..., 09..., 07..., 9xxxxxxxx
+  if (x.startsWith('+251')) return true;
+  if (digits.startsWith('251')) return true;
+  if (x.startsWith('09') || x.startsWith('07')) return true;
+  if (/^9\d{8,}$/.test(digits)) return true; // e.g. 902605253
+
+  return false;
+}
+
+function findBestName(lines) {
+  const byLabel = extractAfterEmojiOrLabel(lines, null, /^(?:Customer\s*Name|Customer|Name):/i);
+  const n1 = normalizeName(byLabel);
+  if (n1) return n1;
+
+  const byEmoji = extractAfterEmojiOrLabel(lines, '👤', null);
+  const n2 = normalizeName(byEmoji);
+  if (n2) return n2;
+
+  // "it's "Name""
+  for (const line of lines) {
+    const m = line.match(/it's\s*"([^"]+)"/i);
+    if (m && m[1]) {
+      const n3 = normalizeName(m[1]);
+      if (n3) return n3;
+    }
+  }
+  return '';
+}
+
+function findBestPhone(lines, raw) {
+  const byEmoji = extractAfterEmojiOrLabel(lines, '📞', null);
+  if (looksLikeRealPhone(byEmoji)) return byEmoji;
+
+  const byLabel = extractAfterEmojiOrLabel(lines, null, /^(?:Phone|Tel|Mobile):/i);
+  if (looksLikeRealPhone(byLabel)) return byLabel;
+
+  // Scan candidates but reject Order-ID/date lines
+  const matches = raw.match(/(\+?\d[\d\s().\-]{6,})/g) || [];
+  const rawLines = raw.split('\n');
+
+  for (const cand of matches) {
+    const c = safeTrim(cand);
+    if (!looksLikeRealPhone(c)) continue;
+
+    const hostLine = rawLines.find(L => L.includes(c)) || '';
+    if (/GG-\d{8}-\d{6}/i.test(hostLine)) continue;
+    if (/Order\s*ID|Total|Delivery|Distance|ETB|Qty|Size|Roast|Type/i.test(hostLine)) continue;
+
+    return c;
+  }
+  return '';
 }
 
 // -------------------- main parser --------------------
@@ -263,22 +305,15 @@ function parseOrderFields(text, opts = {}) {
   const distM = raw.match(/Distance:\s*([\d.]+)\s*km/i);
   const distance_km = distM ? toFloat(distM[1]) : 0;
 
-  // ✅ use labelRegex with emoji-safe extraction
   const pickup = extractAfterEmojiOrLabel(lines, null, /^(?:Pickup|Pick\s*up|Store|Hub):/i);
 
-  // Name: tolerate "Customer:" OR "Name:"
-  const customerNameRaw = extractAfterEmojiOrLabel(lines, null, /^(?:Customer|Name):/i);
+  const customerName = findBestName(lines);
+  const phone = findBestPhone(lines, raw);
 
-  // Phone: tolerate "Phone:" OR "Tel:" OR "Mobile:"
-  let phoneRaw = extractAfterEmojiOrLabel(lines, null, /^(?:Phone|Tel|Mobile):/i);
-
-  // If labeled phone looks wrong, fallback to numeric scan
-  if (!looksLikePhone(phoneRaw)) {
-    const m = raw.match(/(\+?\d[\d\s().\-]{6,})/);
-    phoneRaw = m ? m[1].trim() : '';
-  }
-
-  const emailMatch = raw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  const emailByEmoji = extractAfterEmojiOrLabel(lines, '📧', null);
+  const emailMatch =
+    (emailByEmoji && emailByEmoji.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)) ||
+    raw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   const email = emailMatch ? emailMatch[0] : '';
 
   const address = extractAfterEmojiOrLabel(lines, null, /^(?:Address|Location):/i);
@@ -295,7 +330,6 @@ function parseOrderFields(text, opts = {}) {
 
   const { date_iso, date, time_hms, time_ordered } = deriveDateTimeFromRef(ref);
 
-  // ✅ PROMO
   const promo = parsePromo(raw);
 
   return {
@@ -307,8 +341,8 @@ function parseOrderFields(text, opts = {}) {
     distance_km,
     pickup,
 
-    customerName: normalizeName(customerNameRaw),
-    phone: safeTrim(phoneRaw),
+    customerName: safeTrim(customerName),
+    phone: safeTrim(phone),
     email: safeTrim(email),
     address: safeTrim(address),
     map: safeTrim(map) || '',
@@ -326,7 +360,6 @@ function parseOrderFields(text, opts = {}) {
     time_hms,
     time_ordered,
 
-    // ✅ NEW FIELDS
     promo_code: promo.promo_code || '',
     promo_pct: promo.promo_pct || 0,
   };
