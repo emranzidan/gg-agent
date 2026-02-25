@@ -2,10 +2,7 @@
 // API: isLikelyQuestion, isOrderSummaryStrict, parseOrderFields, extractRef
 'use strict';
 
-const STRICT_DEFAULTS = {
-  strictMode: true,
-  minTextLength: 40,
-};
+const STRICT_DEFAULTS = { strictMode: true, minTextLength: 40 };
 
 // -------------------- basic heuristics --------------------
 function isLikelyQuestion(text) {
@@ -69,13 +66,9 @@ function splitLines(text) {
   return String(text).replace(/\r/g, '')
     .split('\n').map(s => s.trim()).filter(Boolean);
 }
-
-// Unicode-safe strip (keeps Amharic too)
 function stripLeadingNonText(line) {
   return String(line || '').replace(/^[^\p{L}\p{N}+]+/u, '').trim();
 }
-
-// ✅ if emoji is empty, skip emoji search
 function extractAfterEmojiOrLabel(lines, emoji, labelRegex) {
   const emo = (typeof emoji === 'string' && emoji.length > 0) ? emoji : null;
 
@@ -120,7 +113,7 @@ function guessArea(address, pickup) {
 
 function deriveDateTimeFromRef(ref) {
   if (!ref) return { date_iso:null, date:null, time_hms:null, time_ordered:null };
-  let m = ref.match(/^GG-(\d{8})-(\d{6})-/i);
+  const m = ref.match(/^GG-(\d{8})-(\d{6})-/i);
   if (m) {
     const y=m[1].slice(0,4), M=m[1].slice(4,6), d=m[1].slice(6,8);
     const hh=m[2].slice(0,2), mm=m[2].slice(2,4), ss=m[2].slice(4,6);
@@ -131,19 +124,15 @@ function deriveDateTimeFromRef(ref) {
 
 // -------------------- PROMO parser --------------------
 function normCode(c){ return safeTrim(c).toUpperCase(); }
-
 function parsePromo(rawText){
   const text = String(rawText || '');
 
-  // "🏷️ Promo: CODE (5% OFF)" or "Promo: CODE (5% OFF)"
   let m = text.match(/Promo\s*:\s*([^\n(]+)\s*\((\d+)\s*%\s*OFF\)/i);
   if (m) return { promo_code: normCode(m[1]), promo_pct: Number(m[2] || 0) || 0 };
 
-  // "Promo Code: CODE (5% OFF)"
   m = text.match(/Promo\s*Code:\s*([^\n(]+)\s*\((\d+)\s*%\s*OFF\)/i);
   if (m) return { promo_code: normCode(m[1]), promo_pct: Number(m[2] || 0) || 0 };
 
-  // "Order Details (Promo: CODE):" (allow trailing colon)
   m = text.match(/Order\s*Details\s*\(Promo:\s*([^)]+)\)\s*:?/i);
   if (m) return { promo_code: normCode(m[1]), promo_pct: 0 };
 
@@ -189,10 +178,13 @@ function extractItems(lines) {
       if(m) cur.qty=parseInt(m[1],10);
       continue;
     }
-    if (/ETB/i.test(L)){
+
+    // ✅ ONLY treat as item price line if it contains BOTH "x/×" and "="
+    // This prevents "Total: ETB 4226" from corrupting unit_price.
+    if (/ETB/i.test(L) && /(?:x|×)/i.test(L) && /=/i.test(L)) {
       ensureItem();
       const unit=L.match(/ETB\s*([\d,]+)\s*(?:x|×)?/i);
-      const qty=L.match(/x\s*(\d+)/i);
+      const qty=L.match(/(?:x|×)\s*(\d+)/i);
       const line=L.match(/=\s*ETB\s*([\d,]+)/i);
       if(unit) cur.unit_price=cleanMoney(unit[1]);
       if(qty) cur.qty=cur.qty||parseInt(qty[1],10);
@@ -204,6 +196,7 @@ function extractItems(lines) {
   pushIfFilled();
   return items;
 }
+
 function choosePrimaryItem(items){
   if(!items||!items.length) return null;
   const sorted=[...items].sort((a,b)=>{
@@ -232,12 +225,13 @@ function looksLikeRealPhone(s) {
   const digits = x.replace(/[^\d]/g, '');
   if (digits.length < 9 || digits.length > 15) return false;
 
-  // Accept formats:
-  // +251..., 251..., 09..., 07..., 9xxxxxxxx
   if (x.startsWith('+251')) return true;
   if (digits.startsWith('251')) return true;
   if (x.startsWith('09') || x.startsWith('07')) return true;
-  if (/^9\d{8,}$/.test(digits)) return true; // e.g. 902605253
+  if (/^9\d{8,}$/.test(digits)) return true;
+
+  // UAE style like 971...
+  if (digits.startsWith('971') && digits.length >= 11) return true;
 
   return false;
 }
@@ -251,7 +245,6 @@ function findBestName(lines) {
   const n2 = normalizeName(byEmoji);
   if (n2) return n2;
 
-  // "it's "Name""
   for (const line of lines) {
     const m = line.match(/it's\s*"([^"]+)"/i);
     if (m && m[1]) {
@@ -269,7 +262,6 @@ function findBestPhone(lines, raw) {
   const byLabel = extractAfterEmojiOrLabel(lines, null, /^(?:Phone|Tel|Mobile):/i);
   if (looksLikeRealPhone(byLabel)) return byLabel;
 
-  // Scan candidates but reject Order-ID/date lines
   const matches = raw.match(/(\+?\d[\d\s().\-]{6,})/g) || [];
   const rawLines = raw.split('\n');
 
