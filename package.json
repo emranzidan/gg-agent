@@ -1,6 +1,6 @@
 {
   "name": "gg-agent",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "index.js",
   "type": "commonjs",
   "license": "MIT",
@@ -8,12 +8,8 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2",
     "dotenv": "^16.6.1",
     "luxon": "^3.7.1",
     "telegraf": "^4.16.3"
-  },
-  "description": "",
-  "keywords": [],
-  "author": ""
+  }
 }
