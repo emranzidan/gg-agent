@@ -1,26 +1,22 @@
-// index.js — GreenGold EMMA (God Mode)
-// Stable entrypoint. Conversations are handled in ./flows/customerBotFlow.js
-// State & refs live in ./core/session.js. Parsing in ./parser.js
+// index.js — GreenGold EMMA (FINAL, disk store + admin/creator APIs, no Supabase)
+// Keeps your bot logic intact, adds:
+// - /api/admin/* and /api/creator/* endpoints (for Webflow dashboards)
+// - /addcreator CODE PASSWORD (owner-only) to create creator logins
+// - single HTTP server only (no duplicate port binding)
+
 'use strict';
 
-// ────────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const fs   = require('fs');
 const path = require('path');
+const http = require('http');
 const crypto = require('crypto');
 
-// ✅ HTTP server for Render WEB SERVICE (dashboards + live orders + admin/creator APIs)
-const http = require('http');
-
-// Storage + export wiring
-// NOTE: We keep the same store interface (saveOrderIntake / savePaymentStatus / saveDriverEvent).
-// You said: remove old DB attempts (Supabase/Gemini). That cleanup is in services/orderStore.js.
-// This file stays compatible and won't break the bot.
+// Storage (disk JSON via /var/data)
 const store = require('./services/orderStore');
 const wireAdminExportFlow = require('./flows/adminExportFlow');
 
-// Order detection / parsing brain
 const {
   isLikelyQuestion,
   isOrderSummaryStrict,
@@ -52,7 +48,6 @@ function safeReadJSON(file, fallback = {}) {
 }
 function loadFeatures() {
   const f = safeReadJSON(FEATURES_FILE, {});
-  // defaults
   FEATURES = {
     time: { timezone: 'Africa/Addis_Ababa', cutoffHourLocal: 18, ...(f.time || {}) },
     flows: {
@@ -114,7 +109,7 @@ loadMessages();
 loadDriversFromFile();
 
 // ────────────────────────────────────────────────────────────────────────────────
-// Bot config (env + features)
+// Bot config
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) { console.error('Missing BOT_TOKEN'); process.exit(1); }
 
@@ -122,7 +117,6 @@ const OWNER_IDS = String(process.env.OWNER_IDS || '')
   .split(',').map(s => Number(s.trim())).filter(n => Number.isFinite(n));
 if (OWNER_IDS.length === 0) console.warn('WARNING: OWNER_IDS not set.');
 
-// Chat IDs from env
 let STAFF_GROUP_ID   = process.env.STAFF_GROUP_ID   ? Number(process.env.STAFF_GROUP_ID)   : null;
 let SUPPORT_GROUP_ID = process.env.SUPPORT_GROUP_ID ? Number(process.env.SUPPORT_GROUP_ID) : null;
 
@@ -169,7 +163,6 @@ try {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-// IMPORTANT: Create bot BEFORE any bot.* usage or wiring
 const bot = new Telegraf(BOT_TOKEN);
 
 // ────────────────────────────────────────────────────────────────────────────────
@@ -177,6 +170,7 @@ const bot = new Telegraf(BOT_TOKEN);
 const isPrivate = (ctx) => ctx.chat?.type === 'private';
 const isGroup   = (ctx) => ['group', 'supergroup'].includes(ctx.chat?.type);
 const isOwner   = (ctx) => OWNER_IDS.includes(ctx.from?.id);
+
 function now() { return Date.now(); }
 function localHour(tz) {
   try {
@@ -186,6 +180,7 @@ function localHour(tz) {
   }
 }
 function afterCutoff() { return localHour(TIMEZONE) >= CUTOFF_HOUR; }
+
 async function isGroupAdmin(ctx) {
   try {
     if (!isGroup(ctx)) return false;
@@ -208,7 +203,7 @@ function t(key, vars = {}) {
   return s.replace(/\{([A-Z0-9_]+)\}/g, (_, k) => (k in vars ? String(vars[k]) : `{${k}}`));
 }
 
-// Canonical order ID helpers (prefer long GG-... from summary)
+// Canonical ref helpers
 function getCanonicalRef(s) {
   const fromSummary = extractRef(s?.summary || '');
   return fromSummary || s?.ref || '';
@@ -218,6 +213,7 @@ function ensureCanonRef(s) {
   return s._canonRef;
 }
 
+// ────────────────────────────────────────────────────────────────────────────────
 // Timers for driver window
 function setDriverTimer(ref) {
   const s = Session.getSessionByRef(ref); if (!s) return;
@@ -240,7 +236,7 @@ function clearDriverTimer(s) { if (s?.driverTimer) { clearTimeout(s.driverTimer)
 // Sheets poster (best-effort)
 async function postSheets(event, data = {}) {
   if (!(SHEETS_URL && SHEETS_SECRET && FEATURES.flags.sheetsExportEnabled)) return;
-  if (typeof fetch !== 'function') return; // keep safe on older Node
+  if (typeof fetch !== 'function') return;
   try {
     const payload = { secret: SHEETS_SECRET, event, ...data };
     await fetch(SHEETS_URL, {
@@ -255,12 +251,12 @@ async function postSheets(event, data = {}) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-/** SILENT WINDOWS (driver 15s) — schedule external effects after UNDO window */
+// SILENT WINDOWS (driver 15s)
 const UNDO_SECS = 15;
-const openUndos = new Map();     // key = `${ref}:${action}:${driverId}` -> expiresAt (ms)
-const pendingFx = new Map();     // key -> timeout handle
-
+const openUndos = new Map(); // key -> expiresAt
+const pendingFx = new Map(); // key -> timeout handle
 const fxKey = (ref, action, driverId) => `${ref}:${action}:${driverId}`;
+
 function cancelFx(ref, action, driverId) {
   const key = fxKey(ref, action, driverId);
   const h = pendingFx.get(key);
@@ -271,11 +267,10 @@ function scheduleFx(ref, action, driverId, fn) {
   const key = fxKey(ref, action, driverId);
   const h = setTimeout(async () => {
     pendingFx.delete(key);
-    try { await fn(); } catch (e) { /* swallow */ }
+    try { await fn(); } catch {}
   }, UNDO_SECS * 1000);
   pendingFx.set(key, h);
 }
-
 function isUndoOpen(ref, action, driverId) {
   const exp = openUndos.get(fxKey(ref, action, driverId));
   return !!exp && Date.now() <= exp;
@@ -321,7 +316,7 @@ async function showAcceptDeclineToDriver(s, driverId) {
   } catch {}
 }
 
-// Accept → external effects (after 15s if not undone) — write DB even if status moved on
+// Effects (persist + notices)
 function scheduleAcceptEffects(ref, driverId) {
   scheduleFx(ref, 'accept', driverId, async () => {
     const s = Session.getSessionByRef(ref);
@@ -329,11 +324,8 @@ function scheduleAcceptEffects(ref, driverId) {
     const canonRef = ensureCanonRef(s);
     const d = drivers.get(driverId);
 
-    // DB time after 15s
-    try { await store.saveDriverEvent(canonRef, 'accepted', d ? d.name : ''); }
-    catch (e) { console.warn('store.accepted error', e.message); }
+    try { await store.saveDriverEvent(canonRef, 'accepted', d ? d.name : ''); } catch {}
 
-    // Notices (same)
     if (STAFF_GROUP_ID) {
       await bot.telegram.sendMessage(
         STAFF_GROUP_ID,
@@ -345,6 +337,7 @@ function scheduleAcceptEffects(ref, driverId) {
         })
       ).catch(()=>{});
     }
+
     const f = parseOrderFields(s.summary || '');
     if (s._customerId) {
       await bot.telegram.sendMessage(
@@ -356,6 +349,7 @@ function scheduleAcceptEffects(ref, driverId) {
         })
       ).catch(()=>{});
     }
+
     await postSheets('assigned', {
       ref: canonRef,
       customer_name: f.customerName || '',
@@ -372,38 +366,31 @@ function scheduleAcceptEffects(ref, driverId) {
     });
   });
 }
-
-// Picked → external effects (write DB even if status moved)
 function schedulePickedEffects(ref, driverId) {
   scheduleFx(ref, 'picked', driverId, async () => {
     const s = Session.getSessionByRef(ref);
     if (!s) return;
     const canonRef = ensureCanonRef(s);
-
-    // DB time after 15s
     const d = drivers.get(driverId);
-    try { await store.saveDriverEvent(canonRef, 'picked', d ? d.name : ''); }
-    catch (e) { console.warn('store.picked error', e.message); }
 
-    // Notices
+    try { await store.saveDriverEvent(canonRef, 'picked', d ? d.name : ''); } catch {}
+
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.picked_up', { REF: canonRef, USER_ID: driverId })).catch(()=>{});
     if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.picked_up', { REF: canonRef })).catch(()=>{});
   });
 }
-
-// Delivered → external effects (ensure row + times, using canonical id)
 function scheduleDeliveredEffects(ref, driverId) {
   scheduleFx(ref, 'delivered', driverId, async () => {
     const s = Session.getSessionByRef(ref);
     if (!s) return;
     const canonRef = ensureCanonRef(s);
 
-    // Notices
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.delivered', { REF: canonRef, USER_ID: driverId })).catch(()=>{});
     if (s._customerId) await bot.telegram.sendMessage(s._customerId, t('customer.delivered', { REF: canonRef })).catch(()=>{});
 
     const f3 = parseOrderFields(s.summary || '');
     const dInfo2 = drivers.get(driverId);
+
     await postSheets('delivered', {
       ref: canonRef,
       customer_name: f3.customerName || '',
@@ -419,21 +406,18 @@ function scheduleDeliveredEffects(ref, driverId) {
       status: 'DELIVERED'
     });
 
-    // DB: make sure intake exists + mark approved + delivered time (after 15s)
     try {
       const fields = mapFieldsFromSummary(f3, s.summary);
       fields.order_id = canonRef;
-      await store.saveOrderIntake(fields);                 // idempotent upsert
-      await store.savePaymentStatus(canonRef, 'approved'); // final payment state (your current naming)
+      await store.saveOrderIntake(fields);
+      await store.savePaymentStatus(canonRef, 'approved');
       await store.saveDriverEvent(canonRef, 'delivered', dInfo2 ? dInfo2.name : '');
     } catch (e) {
-      console.error('store(delivered) error', e);
+      console.error('persist(delivered) error', e);
       if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${canonRef} (delivered)`).catch(()=>{});
     }
   });
 }
-
-// Give up → external effects (rebroadcast)
 function scheduleGiveupEffects(ref, driverId) {
   scheduleFx(ref, 'giveup', driverId, async () => {
     const s = Session.getSessionByRef(ref);
@@ -443,41 +427,31 @@ function scheduleGiveupEffects(ref, driverId) {
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_canceled_rebroadcast', { REF: ref, USER_ID: driverId })).catch(()=>{});
     await broadcastToDrivers(s, driverId);
     setDriverTimer(ref);
-
-    // Optional: mark pickup undone (no DB change here)
   });
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-// Health & basics
+// Basic commands
 bot.start(async (ctx) => {
   const txt = ctx.message?.text || '';
   const payload = txt.split(' ')[1];
-
   if (payload && payload.startsWith('GG_')) {
     await ctx.reply('Link received. Please paste your order summary here to continue.');
     return;
   }
-
   await ctx.reply('EMMA online. Use /ping here. In your staff group, run /setstaff once.');
 });
 bot.command('ping', async (ctx) => ctx.reply(`pong | ${new Date().toISOString()}`));
 bot.command('me',   async (ctx) => ctx.reply(`Your ID: ${ctx.from.id}`));
 bot.command('id',   async (ctx) => ctx.reply(`Chat ID: ${ctx.chat.id}`));
 
-// Bind staff group
 bot.command('setstaff', async (ctx) => {
   if (!isGroup(ctx)) return ctx.reply('Run /setstaff inside the staff group.');
   if (!isOwner(ctx)) return ctx.reply('Not authorized (owner only).');
   STAFF_GROUP_ID = ctx.chat.id;
-
-  // IMPORTANT: keep env in sync so any flow that reads env will work immediately
   process.env.STAFF_GROUP_ID = String(STAFF_GROUP_ID);
-
   await ctx.reply(`Staff group bound: ${STAFF_GROUP_ID}`);
 });
-
-// Bind support group (optional)
 bot.command('setsupport', async (ctx) => {
   if (!isGroup(ctx)) return ctx.reply('Run /setsupport inside the support group.');
   if (!isOwner(ctx)) return ctx.reply('Not authorized (owner only).');
@@ -497,8 +471,8 @@ bot.command('maintenance', async (ctx) => {
   return ctx.reply('Usage:\n/maintenance on <note>\n/maintenance off');
 });
 
-// Payment text manage via messages.json (in-memory change; persist by editing file)
-const waitFor = new Map(); // chat_id -> 'telebirr'|'bank'
+// Payment text manage via messages.json (in-memory change)
+const waitFor = new Map();
 bot.command('settelebirr', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   waitFor.set(ctx.chat.id, 'telebirr');
@@ -533,80 +507,28 @@ bot.on('text', async (ctx, next) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────────
-// ✅ LIVE DASHBOARD FEED (in-memory)
-// Captures each intake summary that matches your strict rules.
-// Source of truth is store (SQLite plan), this is just for quick polling.
-const __LIVE_FEED_MAX = 250;
-const __liveFeed = []; // newest first
-function __pushLiveFeed(fields, rawText) {
-  try {
-    const totalNum = Number(fields.total || 0) || 0;
-    const delNum   = Number(fields.delivery_price || 0) || 0;
-    const coffeeSubtotal = Math.max(0, totalNum - delNum);
-
-    const item = {
-      received_at: new Date().toISOString(),
-      order_id: fields.order_id || '',
-      promo_code: fields.promo_code || '',
-      promo_pct: fields.promo_pct || 0,
-
-      customer_name: fields.customer_name || '',
-      phone: fields.phone || '',
-      email: fields.email || '',
-
-      type: fields.type || '',
-      size: fields.size || '',
-      qty: fields.qty || '',
-      roast_level: fields.roast_level || '',
-
-      delivery_location: fields.delivery_location || '',
-      map_url: fields.map_url || '',
-
-      delivery_price: delNum,
-      coffee_subtotal: coffeeSubtotal,
-      total: totalNum,
-
-      // keep raw separately, optional via ?raw=1
-      _raw: String(rawText || '')
-    };
-    __liveFeed.unshift(item);
-    if (__liveFeed.length > __LIVE_FEED_MAX) __liveFeed.length = __LIVE_FEED_MAX;
-  } catch {}
-}
-
-// ────────────────────────────────────────────────────────────────────────────────
-// Intake capture middleware (tolerant, ALWAYS continues flow)
+// Intake capture (persist to store on any strict order summary text)
 bot.on('text', async (ctx, next) => {
   try {
     const txt = String(ctx.message?.text || '');
-
-    // Only process if it’s summary-ish
     if (txt && txt.length >= 20) {
       if (isOrderSummaryStrict(txt) || /Order ID:\s*GG-/i.test(txt)) {
         const parsed = parseOrderFields(txt) || {};
         const fields = mapFieldsFromSummary(parsed, txt);
-
-        // Canonical order id
         fields.order_id = extractRef(txt) || parsed.ref || '';
-
         if (fields.order_id) {
-          __pushLiveFeed(fields, txt);
-
-          // Persist intake (store handles DB)
-          await store.saveOrderIntake(fields, ctx).catch(e =>
-            console.warn('saveOrderIntake error:', e.message)
-          );
+          await store.saveOrderIntake(fields, ctx).catch(e => console.warn('saveOrderIntake error:', e.message));
         }
       }
     }
   } catch (e) {
     console.warn('intake middleware error:', e.message);
   }
-
   return (typeof next === 'function' ? next() : undefined);
 });
 
-// Drivers CRUD (+ persistence helpers)
+// ────────────────────────────────────────────────────────────────────────────────
+// Driver CRUD
 bot.command('adddriver', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
   const raw = ctx.message.text.split(' ').slice(1).join(' ');
@@ -649,6 +571,24 @@ bot.command('drivers_export', async (ctx) => {
   return ctx.reply(json);
 });
 
+// ────────────────────────────────────────────────────────────────────────────────
+// ✅ Creator account creation (owner-only)
+// /addcreator CODE PASSWORD
+bot.command('addcreator', async (ctx) => {
+  if (!isOwner(ctx) || !isPrivate(ctx)) return;
+  const parts = ctx.message.text.split(/\s+/).slice(1);
+  const code = String(parts[0] || '').trim();
+  const password = parts.slice(1).join(' ').trim();
+  if (!code || !password) return ctx.reply('Usage:\n/addcreator CODE PASSWORD');
+  try {
+    await store.createCreator({ code, password });
+    return ctx.reply(`✅ Creator created:\nCODE=${String(code).toUpperCase()}\n(Password saved securely)`);
+  } catch (e) {
+    console.error('addcreator error', e);
+    return ctx.reply('Failed to create creator.');
+  }
+});
+
 // Owner: revert & force-approve
 bot.command('revert', async (ctx) => {
   if (!isOwner(ctx) || !isPrivate(ctx)) return;
@@ -658,7 +598,7 @@ bot.command('revert', async (ctx) => {
   s.status = 'AWAITING_RECEIPT';
   s.assigned_driver_id = null; s.giveupUntil = null;
   clearDriverTimer(s);
-  s.createdAt = Date.now(); // refresh TTL
+  s.createdAt = Date.now();
   return ctx.reply(`↩️ Reverted order ${ref} to AWAITING_RECEIPT.`);
 });
 bot.command('forceapprove', async (ctx) => {
@@ -671,7 +611,7 @@ bot.command('forceapprove', async (ctx) => {
   return ctx.reply(`✅ Forced approval for ${ref}.`);
 });
 
-// Ops: optional unassign & rebroadcast (guarded by feature flag)
+// Ops: unassign & rebroadcast
 bot.command('unassign', async (ctx) => {
   if (!OPS_UNASSIGN_EN) return;
   if (!isOwner(ctx) || (isGroup(ctx) && ctx.chat.id !== STAFF_GROUP_ID)) return;
@@ -681,7 +621,7 @@ bot.command('unassign', async (ctx) => {
   if (!s.assigned_driver_id) return ctx.reply('No driver assigned.');
   const quitterId = s.assigned_driver_id;
   s.assigned_driver_id = null; s.status = 'DISPATCHING'; s.giveupUntil = null;
-  if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_canceled_rebroadcast', { REF: s.ref, USER_ID: quitterId }));
+  if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.driver_canceled_rebroadcast', { REF: s.ref, USER_ID: quitterId })).catch(()=>{});
   await broadcastToDrivers(s, quitterId);
   setDriverTimer(s.ref);
   return ctx.reply(`Re-broadcasted ${ref} (excluding ${quitterId}).`);
@@ -706,7 +646,7 @@ bot.command('reload_texts', async (ctx) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────────
-// Callback handlers: support claim, staff approvals, driver actions
+// Callback handlers
 bot.on('callback_query', async (ctx, next) => {
   try {
     const data = String(ctx.callbackQuery.data || '');
@@ -729,7 +669,6 @@ bot.on('callback_query', async (ctx, next) => {
       if (!STAFF_GROUP_ID || ctx.chat.id !== STAFF_GROUP_ID) return ctx.answerCbQuery('Wrong group.');
       if (!(await canApprove(ctx))) return ctx.answerCbQuery('Not authorized.');
 
-      // Undo path → re-review
       if (data.startsWith('undo:')) {
         if (!RE_REVIEW_ON_UNDO) return ctx.answerCbQuery('Undo disabled.');
         const ref = data.split(':')[1];
@@ -738,7 +677,7 @@ bot.on('callback_query', async (ctx, next) => {
         if (s.approvalTimer) { clearTimeout(s.approvalTimer); s.approvalTimer = null; }
         s.status = 'AWAITING_RECEIPT';
         s.assigned_driver_id = null; s.giveupUntil = null;
-        s.createdAt = Date.now(); // refresh TTL
+        s.createdAt = Date.now();
         if (s.holdMsgId) {
           await bot.telegram.editMessageText(STAFF_GROUP_ID, s.holdMsgId, undefined, t('staff.approval_undone_message', { REF: s.ref })).catch(()=>{});
         }
@@ -775,18 +714,18 @@ bot.on('callback_query', async (ctx, next) => {
           if (!fresh || fresh.status !== 'APPROVED_HOLD') return;
           await finalizeApproval(fresh).catch(()=>{});
         }, HOLD_SECONDS * 1000);
-
         return ctx.answerCbQuery('Approved (on hold).');
-      } else {
-        s.status = 'REJECTED';
-        if (uid) await ctx.telegram.sendMessage(uid, t('customer.payment_rejected', { REF: s.ref, SUPPORT_PHONE })).catch(()=>{});
-        await ctx.editMessageCaption({ caption: t('staff.rejected_caption', { REF: s.ref }) }).catch(()=>{});
-        await ctx.telegram.sendMessage(STAFF_GROUP_ID, t('staff.rejected_notice', { REF: s.ref }));
-        return ctx.answerCbQuery('Rejected.');
       }
+
+      // reject
+      s.status = 'REJECTED';
+      if (uid) await ctx.telegram.sendMessage(uid, t('customer.payment_rejected', { REF: s.ref, SUPPORT_PHONE })).catch(()=>{});
+      await ctx.editMessageCaption({ caption: t('staff.rejected_caption', { REF: s.ref }) }).catch(()=>{});
+      await ctx.telegram.sendMessage(STAFF_GROUP_ID, t('staff.rejected_notice', { REF: s.ref }));
+      return ctx.answerCbQuery('Rejected.');
     }
 
-    // Driver accepts / declines
+    // Driver accept/decline
     if (data.startsWith('drv_accept:') || data.startsWith('drv_decline:')) {
       if (!isPrivate(ctx)) return ctx.answerCbQuery('Check your DM with the bot.');
       const [, ref] = data.split(':');
@@ -829,9 +768,9 @@ bot.on('callback_query', async (ctx, next) => {
         await openUndoPrompt(s.ref, 'accept', ctx.from.id, 'ተቀበል');
         scheduleAcceptEffects(s.ref, ctx.from.id);
         return;
-      } else {
-        return ctx.answerCbQuery(get(MSG,'driver.declined_ok') || 'Declined. Thanks.');
       }
+
+      return ctx.answerCbQuery(get(MSG,'driver.declined_ok') || 'Declined. Thanks.');
     }
 
     // Driver picked / delivered / give up
@@ -858,13 +797,13 @@ bot.on('callback_query', async (ctx, next) => {
         await openUndoPrompt(s.ref, 'picked', ctx.from.id, 'ተነሳ');
         schedulePickedEffects(s.ref, ctx.from.id);
         return;
-      } else {
-        s.status = 'DELIVERED';
-        await ctx.answerCbQuery(get(MSG,'driver.delivered_marked') || 'Delivered.');
-        await openUndoPrompt(s.ref, 'delivered', ctx.from.id, 'ተደረሰ');
-        scheduleDeliveredEffects(s.ref, ctx.from.id);
-        return;
       }
+
+      s.status = 'DELIVERED';
+      await ctx.answerCbQuery(get(MSG,'driver.delivered_marked') || 'Delivered.');
+      await openUndoPrompt(s.ref, 'delivered', ctx.from.id, 'ተደረሰ');
+      scheduleDeliveredEffects(s.ref, ctx.from.id);
+      return;
     }
 
     // UNDO button for driver actions (15s window)
@@ -890,7 +829,6 @@ bot.on('callback_query', async (ctx, next) => {
         await showAcceptDeclineToDriver(s, driverId);
         return;
       }
-
       if (action === 'picked') {
         if (s.status !== 'OUT_FOR_DELIVERY') { await ctx.answerCbQuery('Nothing to undo.'); return; }
         s.status = 'ASSIGNED';
@@ -898,7 +836,6 @@ bot.on('callback_query', async (ctx, next) => {
         await showDriverActions(ref, driverId);
         return;
       }
-
       if (action === 'delivered') {
         if (s.status !== 'DELIVERED') { await ctx.answerCbQuery('Nothing to undo.'); return; }
         s.status = 'OUT_FOR_DELIVERY';
@@ -906,7 +843,6 @@ bot.on('callback_query', async (ctx, next) => {
         await showDriverActions(ref, driverId);
         return;
       }
-
       if (action === 'giveup') {
         if (s.status !== 'DISPATCHING' || s.assigned_driver_id) { await ctx.answerCbQuery('Nothing to undo.'); return; }
         s.assigned_driver_id = driverId;
@@ -926,23 +862,24 @@ bot.on('callback_query', async (ctx, next) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────────
-// Finalize approval after hold (notify customer + dispatch)
+// Finalize approval after hold (this is your PAID moment)
 async function finalizeApproval(s) {
   try {
     if (!s || s.status !== 'APPROVED_HOLD') return;
     s.status = 'DISPATCHING';
+
     if (s.holdMsgId) {
       await bot.telegram.editMessageText(STAFF_GROUP_ID, s.holdMsgId, undefined, t('staff.finalize_approved', { REF: s.ref })).catch(()=>{});
     }
 
-    // ✅ Customer DM only NOW (after full hold)
     if (s._customerId) {
       await bot.telegram.sendMessage(s._customerId, t('customer.payment_confirmed_after_hold', { REF: s.ref })).catch(()=>{});
     }
 
-    if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.dispatching_notice', { REF: s.ref }));
+    if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.dispatching_notice', { REF: s.ref })).catch(()=>{});
 
     const f = parseOrderFields(s.summary || '');
+
     await postSheets('approved', {
       ref: s.ref,
       customer_name: f.customerName || '',
@@ -955,16 +892,16 @@ async function finalizeApproval(s) {
       status: 'APPROVED'
     });
 
-    // Persist payment_confirmed using canonical id (idempotent)
+    // Persist approved + intake
     try {
       const canonRef = ensureCanonRef(s);
       const fields = mapFieldsFromSummary(f, s.summary);
       fields.order_id = canonRef;
-      await store.saveOrderIntake(fields);                 // upsert intake row if missing
-      await store.savePaymentStatus(canonRef, 'approved'); // mark approved (your naming)
+      await store.saveOrderIntake(fields);
+      await store.savePaymentStatus(canonRef, 'approved');
     } catch (e) {
-      console.error('store(payment_confirmed) error', e);
-      if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${s.ref} (payment_confirmed)`).catch(()=>{});
+      console.error('persist(approved) error', e);
+      if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${s.ref} (approved)`).catch(()=>{});
     }
 
     await broadcastToDrivers(s);
@@ -1021,7 +958,6 @@ async function broadcastToDrivers(s, excludeId = null) {
 // Wire customer flow
 try {
   const wireCustomerFlow = require('./flows/customerBotFlow');
-  // NOTE: pass getter functions too (so later we can read updated group IDs without redeploy)
   wireCustomerFlow(bot, {
     FEATURES,
     SUPPORT_PHONE,
@@ -1051,7 +987,7 @@ try {
   console.warn('flows/customerBotFlow missing — customer conversations will be inactive until you add it.');
 }
 
-// NEW: wire export commands (/export orders, /clear_and_export_orders)
+// Wire export commands
 try {
   wireAdminExportFlow(bot, { store });
   console.log('flows/adminExportFlow wired.');
@@ -1060,16 +996,10 @@ try {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-// ✅ WEB SERVICE API SERVER
-// - GET  /health
-// - GET  /api/live-orders
-// - (Reserved for next phase) /api/admin/* , /api/creator/*
-// NOTE: These endpoints do NOT change bot behavior.
-// They only enable Webflow dashboards to read/write after you build them.
-
+// ✅ WEB SERVICE API SERVER (for Webflow dashboards + live feed)
 const __PORT = Number(process.env.PORT || 10000);
 
-// CORS helpers
+// CORS
 const __ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '*')
   .split(',')
   .map(s => s.trim())
@@ -1078,7 +1008,6 @@ const __ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '*')
 function __originAllowed(origin) {
   if (!origin) return false;
   if (__ALLOWED_ORIGINS.includes('*')) return true;
-  // allow exact match or suffix wildcard like *.webflow.io
   for (const a of __ALLOWED_ORIGINS) {
     if (a === origin) return true;
     if (a.startsWith('*.')) {
@@ -1088,7 +1017,6 @@ function __originAllowed(origin) {
   }
   return false;
 }
-
 function __setCors(req, res) {
   const origin = req.headers.origin || '';
   if (__ALLOWED_ORIGINS.includes('*')) {
@@ -1100,7 +1028,6 @@ function __setCors(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
 }
-
 function __json(res, status, obj) {
   try {
     const body = JSON.stringify(obj);
@@ -1112,8 +1039,7 @@ function __json(res, status, obj) {
     res.end('{"error":"json_failed"}');
   }
 }
-
-function __readBody(req, limitBytes = 1024 * 1024) {
+function __readBody(req, limitBytes = 256 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
@@ -1131,7 +1057,7 @@ function __readBody(req, limitBytes = 1024 * 1024) {
   });
 }
 
-// Tiny JWT (no deps) for next phase dashboards
+// JWT (no deps)
 const JWT_SECRET = String(process.env.JWT_SECRET || '');
 function __b64url(buf) {
   return Buffer.from(buf).toString('base64').replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
@@ -1152,10 +1078,16 @@ function __verifyToken(token) {
     const parts = String(token || '').split('.');
     if (parts.length !== 3) return null;
     const [h, p, s] = parts;
-    const ok = __sign(`${h}.${p}`) === s;
-    if (!ok) return null;
+    if (__sign(`${h}.${p}`) !== s) return null;
+
     const json = Buffer.from(p.replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString('utf8');
-    return JSON.parse(json);
+    const obj = JSON.parse(json);
+
+    // exp support (ms)
+    if (obj && obj.exp && typeof obj.exp === 'number') {
+      if (Date.now() > obj.exp) return null;
+    }
+    return obj;
   } catch { return null; }
 }
 function __getBearer(req) {
@@ -1169,11 +1101,7 @@ async function __fetchLiveOrdersFromStore(limit) {
     if (store && typeof store.getLiveOrders === 'function') return await store.getLiveOrders({ limit });
     if (store && typeof store.listLiveOrders === 'function') return await store.listLiveOrders({ limit });
     if (store && typeof store.listRecentOrders === 'function') return await store.listRecentOrders({ limit });
-    if (store && typeof store.exportOrders === 'function') {
-      const out = await store.exportOrders({ limit });
-      if (Array.isArray(out)) return out;
-      if (out && Array.isArray(out.orders)) return out.orders;
-    }
+    if (store && typeof store.listOrders === 'function') return await store.listOrders({ limit });
   } catch (e) {
     console.warn('live store fetch error:', e.message);
   }
@@ -1182,101 +1110,167 @@ async function __fetchLiveOrdersFromStore(limit) {
 
 const __server = http.createServer(async (req, res) => {
   __setCors(req, res);
-
   if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end(); }
 
   let u;
-  try {
-    u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  } catch {
-    res.statusCode = 400;
-    return res.end('bad url');
-  }
+  try { u = new URL(req.url, `http://${req.headers.host || 'localhost'}`); }
+  catch { return __json(res, 400, { ok:false, error:'bad_url' }); }
 
   // Health
   if (u.pathname === '/' || u.pathname === '/health') {
     return __json(res, 200, { ok: true, service: 'gg-agent', time: new Date().toISOString() });
   }
 
-  // Live feed (for quick polling / debugging)
+  // Live feed (debug)
   if (u.pathname === '/api/live-orders' && req.method === 'GET') {
     const limit = Math.max(1, Math.min(250, Number(u.searchParams.get('limit') || 50)));
     const includeRaw = String(u.searchParams.get('raw') || '') === '1';
 
     const fromStore = await __fetchLiveOrdersFromStore(limit);
-    const source = Array.isArray(fromStore) && fromStore.length ? 'store' : 'memory';
-    let items = (source === 'store') ? fromStore : __liveFeed.slice(0, limit);
+    const source = Array.isArray(fromStore) && fromStore.length ? 'store' : 'store';
+    let items = Array.isArray(fromStore) ? fromStore.slice(0, limit) : [];
 
-    items = (Array.isArray(items) ? items : []).slice(0, limit).map((x) => {
-      const o = { ...(x || {}) };
-      if (!o.received_at) o.received_at = o.created_at || new Date().toISOString();
-
+    items = items.map((o) => {
+      const x = { ...(o || {}) };
       if (!includeRaw) {
-        delete o._raw;
-        delete o.raw;
-        delete o.draft;
-        delete o.telegram_draft;
+        delete x._raw; delete x.raw; delete x.draft; delete x.telegram_draft; delete x.raw_text;
       }
-      return o;
+      if (!x.received_at) x.received_at = x.created_at || new Date().toISOString();
+      return x;
     });
 
-    return __json(res, 200, { ok: true, source, count: items.length, items });
+    return __json(res, 200, { ok:true, source, count: items.length, items });
   }
 
-  // Reserved (next phase): Admin + Creator APIs
-  // We keep them stubbed so nothing breaks today.
+  // ────────────────────────────────────────────────────────────────────────────
+  // ADMIN APIs
+  // POST /api/admin/login {username,password}
   if (u.pathname === '/api/admin/login' && req.method === 'POST') {
     try {
-      const body = await __readBody(req, 64 * 1024);
-      const data = JSON.parse(body || '{}');
-
       const ADMIN_USER = String(process.env.ADMIN_USER || '');
       const ADMIN_PASS = String(process.env.ADMIN_PASS || '');
       if (!ADMIN_USER || !ADMIN_PASS || !JWT_SECRET) {
         return __json(res, 501, { ok:false, error:'admin_auth_not_configured' });
       }
 
+      const body = await __readBody(req);
+      const data = JSON.parse(body || '{}');
+
       const ok = String(data.username || '') === ADMIN_USER && String(data.password || '') === ADMIN_PASS;
       if (!ok) return __json(res, 401, { ok:false, error:'invalid_credentials' });
 
-      const token = __makeToken({ role:'admin', iat: Date.now() });
+      const token = __makeToken({ role:'admin', iat: Date.now(), exp: Date.now() + 7*24*60*60*1000 });
       return __json(res, 200, { ok:true, token });
     } catch {
       return __json(res, 400, { ok:false, error:'bad_request' });
     }
   }
 
-  if (u.pathname === '/api/creator/login' && req.method === 'POST') {
-    // NOTE: real validation will be implemented in store (SQLite) next.
-    try {
-      const body = await __readBody(req, 64 * 1024);
-      const data = JSON.parse(body || '{}');
-      if (!JWT_SECRET) return __json(res, 501, { ok:false, error:'jwt_not_configured' });
+  // GET /api/admin/orders?limit=200&status=approved
+  if (u.pathname === '/api/admin/orders' && req.method === 'GET') {
+    const auth = __verifyToken(__getBearer(req));
+    if (!auth || auth.role !== 'admin') return __json(res, 401, { ok:false, error:'unauthorized' });
 
+    const limit = Math.max(1, Math.min(1000, Number(u.searchParams.get('limit') || 200)));
+    const status = String(u.searchParams.get('status') || '').trim(); // approved/rejected/pending
+
+    try {
+      const items = await store.listOrders({ limit, payment_status: status });
+      return __json(res, 200, { ok:true, count: items.length, items });
+    } catch (e) {
+      return __json(res, 500, { ok:false, error:'store_failed' });
+    }
+  }
+
+  // PATCH /api/admin/orders/:id
+  // Body: { payment_status?: 'approved'|'rejected'|'pending', driver_event?: 'accepted'|'picked'|'delivered', driver_name?: 'Tolosa' }
+  if (u.pathname.startsWith('/api/admin/orders/') && req.method === 'PATCH') {
+    const auth = __verifyToken(__getBearer(req));
+    if (!auth || auth.role !== 'admin') return __json(res, 401, { ok:false, error:'unauthorized' });
+
+    const orderId = decodeURIComponent(u.pathname.replace('/api/admin/orders/', '').trim());
+    if (!orderId) return __json(res, 400, { ok:false, error:'missing_order_id' });
+
+    try {
+      const body = await __readBody(req);
+      const data = JSON.parse(body || '{}');
+
+      if (data.payment_status) {
+        await store.savePaymentStatus(orderId, String(data.payment_status).toLowerCase());
+      }
+      if (data.driver_event) {
+        const kind = String(data.driver_event).toLowerCase();
+        const dn = data.driver_name ? String(data.driver_name) : '';
+        await store.saveDriverEvent(orderId, kind, dn);
+      }
+
+      return __json(res, 200, { ok:true });
+    } catch (e) {
+      return __json(res, 400, { ok:false, error:'bad_request' });
+    }
+  }
+
+  // GET /api/admin/leaderboard
+  if (u.pathname === '/api/admin/leaderboard' && req.method === 'GET') {
+    const auth = __verifyToken(__getBearer(req));
+    if (!auth || auth.role !== 'admin') return __json(res, 401, { ok:false, error:'unauthorized' });
+    try {
+      const out = await store.getLeaderboard();
+      return __json(res, 200, out);
+    } catch {
+      return __json(res, 500, { ok:false, error:'store_failed' });
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // CREATOR APIs
+  // POST /api/creator/login {code,password}
+  if (u.pathname === '/api/creator/login' && req.method === 'POST') {
+    if (!JWT_SECRET) return __json(res, 501, { ok:false, error:'jwt_not_configured' });
+    try {
+      const body = await __readBody(req);
+      const data = JSON.parse(body || '{}');
       const code = String(data.code || '').trim();
       const password = String(data.password || '').trim();
       if (!code || !password) return __json(res, 400, { ok:false, error:'missing_fields' });
 
-      // If store supports credential check, use it. Else block (secure default).
-      if (store && typeof store.verifyCreatorLogin === 'function') {
-        const ok = await store.verifyCreatorLogin({ code, password });
-        if (!ok) return __json(res, 401, { ok:false, error:'invalid_credentials' });
-        const token = __makeToken({ role:'creator', code, iat: Date.now() });
-        return __json(res, 200, { ok:true, token });
-      }
-      return __json(res, 501, { ok:false, error:'creator_auth_not_ready' });
+      const ok = await store.verifyCreatorLogin({ code, password });
+      if (!ok) return __json(res, 401, { ok:false, error:'invalid_credentials' });
+
+      const token = __makeToken({ role:'creator', code: String(code).toUpperCase(), iat: Date.now(), exp: Date.now() + 30*24*60*60*1000 });
+      return __json(res, 200, { ok:true, token });
     } catch {
       return __json(res, 400, { ok:false, error:'bad_request' });
     }
   }
 
-  // Default
-  return __json(res, 404, { ok: false, error: 'not_found' });
+  // GET /api/creator/summary  (Bearer token)
+  if (u.pathname === '/api/creator/summary' && req.method === 'GET') {
+    const auth = __verifyToken(__getBearer(req));
+    if (!auth || auth.role !== 'creator' || !auth.code) return __json(res, 401, { ok:false, error:'unauthorized' });
+    try {
+      const out = await store.getCreatorSummary(auth.code);
+      return __json(res, 200, out);
+    } catch {
+      return __json(res, 500, { ok:false, error:'store_failed' });
+    }
+  }
+
+  // GET /api/creator/leaderboard
+  if (u.pathname === '/api/creator/leaderboard' && req.method === 'GET') {
+    try {
+      const out = await store.getLeaderboard();
+      return __json(res, 200, out);
+    } catch {
+      return __json(res, 500, { ok:false, error:'store_failed' });
+    }
+  }
+
+  return __json(res, 404, { ok:false, error:'not_found' });
 });
 
-// NOTE: Render only gives you a public URL if this is a WEB SERVICE.
 __server.listen(__PORT, () => {
-  console.log(`WEB API listening on :${__PORT} | health=/health | live=/api/live-orders`);
+  console.log(`WEB API listening on :${__PORT} | /health | /api/live-orders | /api/admin/* | /api/creator/*`);
 });
 
 // ────────────────────────────────────────────────────────────────────────────────
@@ -1292,12 +1286,17 @@ process.once('SIGTERM', () => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────────
-// Helpers
+// Helpers: convert parsed summary → store fields
 function mapFieldsFromSummary(parsed, rawText) {
   const f = parsed || {};
-  const email = (rawText && (rawText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] || '')) || '';
+
+  // email: prefer parser email; fallback scan
+  const email = f.email || (rawText && (rawText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] || '')) || '';
+
+  // address: prefer labeled "Address:" extraction from parser; fallback "area"
   const addrMatch = rawText && rawText.match(/Address:\s*([^\n]+)/i);
-  const address = addrMatch ? addrMatch[1].trim() : (f.area || '');
+  const address = addrMatch ? addrMatch[1].trim() : (f.address || f.area || '');
+
   const map_url = f.map || '';
 
   const totalNum = Number(f.total || 0) || 0;
@@ -1305,29 +1304,25 @@ function mapFieldsFromSummary(parsed, rawText) {
   const coffeeSubtotal = Math.max(0, totalNum - delNum);
 
   return {
-    customer_name:  f.customerName || '',
-    email,
-    phone:          f.phone || '',
+    customer_name:  f.customerName || null,
+    email:          email || null,
+    phone:          f.phone || null,
 
-    type:           f.type || '',
-    size:           f.size || '',
-    roast_level:    f.roast || '',
-    qty:            f.qty || '',
+    type:           f.type || null,
+    size:           f.size || null,
+    roast_level:    f.roast || null,
+    qty:            f.qty || null,
 
-    // Totals
     delivery_price: delNum,
     total:          totalNum,
     coffee_subtotal: coffeeSubtotal,
 
-    // Location
-    delivery_location: address,
-    map_url,
+    delivery_location: address || null,
+    map_url:        map_url || null,
 
-    // ✅ Creator program
-    promo_code: f.promo_code || '',
-    promo_pct:  f.promo_pct || 0,
+    promo_code:     f.promo_code || '',
+    promo_pct:      Number(f.promo_pct || 0) || 0,
 
-    // Optional raw items if store wants them later
     items: Array.isArray(f.items) ? f.items : []
   };
 }
