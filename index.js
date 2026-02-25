@@ -1,4 +1,4 @@
-// index.js — GreenGold EMMA (God Mode, Supabase memory wired)
+// index.js — GreenGold EMMA (God Mode)
 // Stable entrypoint. Conversations are handled in ./flows/customerBotFlow.js
 // State & refs live in ./core/session.js. Parsing in ./parser.js
 'use strict';
@@ -8,13 +8,17 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const fs   = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
-// ✅ LIVE DASHBOARD API (NO NPM DEPS)
+// ✅ HTTP server for Render WEB SERVICE (dashboards + live orders + admin/creator APIs)
 const http = require('http');
 
-// EMMA: NEW storage + export wiring (replaces old memory/export attempt)
-const store = require('./services/orderStore');                  // NEW
-const wireAdminExportFlow = require('./flows/adminExportFlow');  // NEW
+// Storage + export wiring
+// NOTE: We keep the same store interface (saveOrderIntake / savePaymentStatus / saveDriverEvent).
+// You said: remove old DB attempts (Supabase/Gemini). That cleanup is in services/orderStore.js.
+// This file stays compatible and won't break the bot.
+const store = require('./services/orderStore');
+const wireAdminExportFlow = require('./flows/adminExportFlow');
 
 // Order detection / parsing brain
 const {
@@ -201,7 +205,6 @@ function get(obj, pathStr) {
 function t(key, vars = {}) {
   let s = get(MSG, key);
   if (!s || typeof s !== 'string') return key;
-  // FIX: templating regex
   return s.replace(/\{([A-Z0-9_]+)\}/g, (_, k) => (k in vars ? String(vars[k]) : `{${k}}`));
 }
 
@@ -237,6 +240,7 @@ function clearDriverTimer(s) { if (s?.driverTimer) { clearTimeout(s.driverTimer)
 // Sheets poster (best-effort)
 async function postSheets(event, data = {}) {
   if (!(SHEETS_URL && SHEETS_SECRET && FEATURES.flags.sheetsExportEnabled)) return;
+  if (typeof fetch !== 'function') return; // keep safe on older Node
   try {
     const payload = { secret: SHEETS_SECRET, event, ...data };
     await fetch(SHEETS_URL, {
@@ -420,7 +424,7 @@ function scheduleDeliveredEffects(ref, driverId) {
       const fields = mapFieldsFromSummary(f3, s.summary);
       fields.order_id = canonRef;
       await store.saveOrderIntake(fields);                 // idempotent upsert
-      await store.savePaymentStatus(canonRef, 'approved'); // final payment state
+      await store.savePaymentStatus(canonRef, 'approved'); // final payment state (your current naming)
       await store.saveDriverEvent(canonRef, 'delivered', dInfo2 ? dInfo2.name : '');
     } catch (e) {
       console.error('store(delivered) error', e);
@@ -466,7 +470,20 @@ bot.command('setstaff', async (ctx) => {
   if (!isGroup(ctx)) return ctx.reply('Run /setstaff inside the staff group.');
   if (!isOwner(ctx)) return ctx.reply('Not authorized (owner only).');
   STAFF_GROUP_ID = ctx.chat.id;
+
+  // IMPORTANT: keep env in sync so any flow that reads env will work immediately
+  process.env.STAFF_GROUP_ID = String(STAFF_GROUP_ID);
+
   await ctx.reply(`Staff group bound: ${STAFF_GROUP_ID}`);
+});
+
+// Bind support group (optional)
+bot.command('setsupport', async (ctx) => {
+  if (!isGroup(ctx)) return ctx.reply('Run /setsupport inside the support group.');
+  if (!isOwner(ctx)) return ctx.reply('Not authorized (owner only).');
+  SUPPORT_GROUP_ID = ctx.chat.id;
+  process.env.SUPPORT_GROUP_ID = String(SUPPORT_GROUP_ID);
+  await ctx.reply(`Support group bound: ${SUPPORT_GROUP_ID}`);
 });
 
 // Maintenance
@@ -518,27 +535,37 @@ bot.on('text', async (ctx, next) => {
 // ────────────────────────────────────────────────────────────────────────────────
 // ✅ LIVE DASHBOARD FEED (in-memory)
 // Captures each intake summary that matches your strict rules.
-// Your Supabase store stays the source of truth, this is just for live polling.
+// Source of truth is store (SQLite plan), this is just for quick polling.
 const __LIVE_FEED_MAX = 250;
 const __liveFeed = []; // newest first
 function __pushLiveFeed(fields, rawText) {
   try {
+    const totalNum = Number(fields.total || 0) || 0;
+    const delNum   = Number(fields.delivery_price || 0) || 0;
+    const coffeeSubtotal = Math.max(0, totalNum - delNum);
+
     const item = {
       received_at: new Date().toISOString(),
       order_id: fields.order_id || '',
-      promo_code: fields.promo_code || fields.promo || '',
+      promo_code: fields.promo_code || '',
+      promo_pct: fields.promo_pct || 0,
+
       customer_name: fields.customer_name || '',
       phone: fields.phone || '',
       email: fields.email || '',
+
       type: fields.type || '',
       size: fields.size || '',
       qty: fields.qty || '',
       roast_level: fields.roast_level || '',
+
       delivery_location: fields.delivery_location || '',
       map_url: fields.map_url || '',
-      delivery_price: fields.delivery_price || '',
-      product_price: fields.product_price || null,
-      total: fields.total || '',
+
+      delivery_price: delNum,
+      coffee_subtotal: coffeeSubtotal,
+      total: totalNum,
+
       // keep raw separately, optional via ?raw=1
       _raw: String(rawText || '')
     };
@@ -548,31 +575,24 @@ function __pushLiveFeed(fields, rawText) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-// NEW: Intake capture middleware (fixed: call next() only once)
+// Intake capture middleware (tolerant, ALWAYS continues flow)
 bot.on('text', async (ctx, next) => {
   try {
     const txt = String(ctx.message?.text || '');
 
-    // Only process if it’s a real summary-length message
+    // Only process if it’s summary-ish
     if (txt && txt.length >= 20) {
       if (isOrderSummaryStrict(txt) || /Order ID:\s*GG-/i.test(txt)) {
         const parsed = parseOrderFields(txt) || {};
-        const fields  = mapFieldsFromSummary(parsed, txt);
-        fields.order_id = extractRef(txt) || parsed.ref || ''; // GG-...
+        const fields = mapFieldsFromSummary(parsed, txt);
 
-        // ✅ capture promo if present in raw summary (best-effort)
-        // Works with: "Promo: tinsu17" OR "(Promo: tinsu17)" OR "🏷️ Promo: TINSU17"
-        const promoMatch =
-          txt.match(/\bPromo:\s*([A-Z0-9@_-]{3,32})\b/i) ||
-          txt.match(/\(Promo:\s*([A-Z0-9@_-]{3,32})\)/i) ||
-          txt.match(/🏷️\s*Promo:\s*([A-Z0-9@_-]{3,32})/i);
-        if (promoMatch && promoMatch[1]) fields.promo_code = String(promoMatch[1]).trim();
+        // Canonical order id
+        fields.order_id = extractRef(txt) || parsed.ref || '';
 
         if (fields.order_id) {
-          // ✅ push to live feed (memory)
           __pushLiveFeed(fields, txt);
 
-          // ✅ save to supabase (your existing behavior)
+          // Persist intake (store handles DB)
           await store.saveOrderIntake(fields, ctx).catch(e =>
             console.warn('saveOrderIntake error:', e.message)
           );
@@ -583,7 +603,6 @@ bot.on('text', async (ctx, next) => {
     console.warn('intake middleware error:', e.message);
   }
 
-  // Call next ONCE, here.
   return (typeof next === 'function' ? next() : undefined);
 });
 
@@ -756,7 +775,7 @@ bot.on('callback_query', async (ctx, next) => {
           if (!fresh || fresh.status !== 'APPROVED_HOLD') return;
           await finalizeApproval(fresh).catch(()=>{});
         }, HOLD_SECONDS * 1000);
-        // Customer DM only after hold in finalizeApproval()
+
         return ctx.answerCbQuery('Approved (on hold).');
       } else {
         s.status = 'REJECTED';
@@ -807,7 +826,6 @@ bot.on('callback_query', async (ctx, next) => {
         await ctx.reply(assignedCard, driverActions);
         await ctx.answerCbQuery('Assigned to you.');
 
-        // Silent window: only show UNDO to driver + schedule effects
         await openUndoPrompt(s.ref, 'accept', ctx.from.id, 'ተቀበል');
         scheduleAcceptEffects(s.ref, ctx.from.id);
         return;
@@ -829,7 +847,6 @@ bot.on('callback_query', async (ctx, next) => {
         const quitterId = s.assigned_driver_id;
         s.assigned_driver_id = null; s.status = 'DISPATCHING'; s.giveupUntil = null;
         await ctx.answerCbQuery(get(MSG,'driver.giveup_ok') || 'Given up.');
-        // Silent window: undo + schedule rebroadcast (no immediate staff/broadcast)
         await openUndoPrompt(s.ref, 'giveup', ctx.from.id, 'እተዋለሁ');
         scheduleGiveupEffects(s.ref, quitterId);
         return;
@@ -838,14 +855,12 @@ bot.on('callback_query', async (ctx, next) => {
       if (data.startsWith('drv_picked:')) {
         s.status = 'OUT_FOR_DELIVERY';
         await ctx.answerCbQuery(get(MSG,'driver.picked_marked') || 'Picked.');
-        // Silent window: undo + schedule staff/customer notices
         await openUndoPrompt(s.ref, 'picked', ctx.from.id, 'ተነሳ');
         schedulePickedEffects(s.ref, ctx.from.id);
         return;
       } else {
         s.status = 'DELIVERED';
         await ctx.answerCbQuery(get(MSG,'driver.delivered_marked') || 'Delivered.');
-        // Silent window: undo + schedule staff/customer + sheets + persist
         await openUndoPrompt(s.ref, 'delivered', ctx.from.id, 'ተደረሰ');
         scheduleDeliveredEffects(s.ref, ctx.from.id);
         return;
@@ -861,7 +876,7 @@ bot.on('callback_query', async (ctx, next) => {
         await ctx.answerCbQuery('Undo window expired.');
         return;
       }
-      cancelFx(ref, action, driverId); // cancel pending external effects
+      cancelFx(ref, action, driverId);
 
       const s = Session.getSessionByRef(ref);
       if (!s) { await ctx.answerCbQuery('Order not found.'); return; }
@@ -927,7 +942,6 @@ async function finalizeApproval(s) {
 
     if (STAFF_GROUP_ID) await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.dispatching_notice', { REF: s.ref }));
 
-    // Sheets: approved
     const f = parseOrderFields(s.summary || '');
     await postSheets('approved', {
       ref: s.ref,
@@ -947,7 +961,7 @@ async function finalizeApproval(s) {
       const fields = mapFieldsFromSummary(f, s.summary);
       fields.order_id = canonRef;
       await store.saveOrderIntake(fields);                 // upsert intake row if missing
-      await store.savePaymentStatus(canonRef, 'approved'); // mark approved
+      await store.savePaymentStatus(canonRef, 'approved'); // mark approved (your naming)
     } catch (e) {
       console.error('store(payment_confirmed) error', e);
       if (STAFF_GROUP_ID) bot.telegram.sendMessage(STAFF_GROUP_ID, `⚠️ Persist failed for ${s.ref} (payment_confirmed)`).catch(()=>{});
@@ -1007,25 +1021,29 @@ async function broadcastToDrivers(s, excludeId = null) {
 // Wire customer flow
 try {
   const wireCustomerFlow = require('./flows/customerBotFlow');
+  // NOTE: pass getter functions too (so later we can read updated group IDs without redeploy)
   wireCustomerFlow(bot, {
     FEATURES,
     SUPPORT_PHONE,
     SUPPORT_GROUP_ID,
     STAFF_GROUP_ID,
+    getSupportGroupId: () => SUPPORT_GROUP_ID,
+    getStaffGroupId: () => STAFF_GROUP_ID,
+
     BUTTON_TTL_SEC,
     ALLOW_NEW_ORDER,
-    // parser helpers
+
     isLikelyQuestion,
     isOrderSummaryStrict,
     parseOrderFields,
     extractRef,
-    // templating
+
     t, get,
-    // session API
+
     Session,
-    // misc
+
     afterCutoff,
-    // expose MSG for flow (optional)
+
     MSG
   });
   console.log('flows/customerBotFlow wired.');
@@ -1033,7 +1051,6 @@ try {
   console.warn('flows/customerBotFlow missing — customer conversations will be inactive until you add it.');
 }
 
-// ────────────────────────────────────────────────────────────────────────────────
 // NEW: wire export commands (/export orders, /clear_and_export_orders)
 try {
   wireAdminExportFlow(bot, { store });
@@ -1043,11 +1060,47 @@ try {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-// ✅ LIVE DASHBOARD API SERVER
-// Public endpoint: GET /api/live-orders
-// Query params:
-//   ?limit=50 (default 50, max 250)
-//   ?raw=1    (include raw telegram draft text)
+// ✅ WEB SERVICE API SERVER
+// - GET  /health
+// - GET  /api/live-orders
+// - (Reserved for next phase) /api/admin/* , /api/creator/*
+// NOTE: These endpoints do NOT change bot behavior.
+// They only enable Webflow dashboards to read/write after you build them.
+
+const __PORT = Number(process.env.PORT || 10000);
+
+// CORS helpers
+const __ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '*')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+function __originAllowed(origin) {
+  if (!origin) return false;
+  if (__ALLOWED_ORIGINS.includes('*')) return true;
+  // allow exact match or suffix wildcard like *.webflow.io
+  for (const a of __ALLOWED_ORIGINS) {
+    if (a === origin) return true;
+    if (a.startsWith('*.')) {
+      const suffix = a.slice(1); // ".webflow.io"
+      if (origin.endsWith(suffix)) return true;
+    }
+  }
+  return false;
+}
+
+function __setCors(req, res) {
+  const origin = req.headers.origin || '';
+  if (__ALLOWED_ORIGINS.includes('*')) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (__originAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+}
+
 function __json(res, status, obj) {
   try {
     const body = JSON.stringify(obj);
@@ -1059,15 +1112,59 @@ function __json(res, status, obj) {
     res.end('{"error":"json_failed"}');
   }
 }
-function __setCors(res) {
-  const ORIGIN = process.env.LIVE_API_ALLOW_ORIGIN || '*';
-  res.setHeader('Access-Control-Allow-Origin', ORIGIN);
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+
+function __readBody(req, limitBytes = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limitBytes) {
+        reject(new Error('body_too_large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+// Tiny JWT (no deps) for next phase dashboards
+const JWT_SECRET = String(process.env.JWT_SECRET || '');
+function __b64url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+}
+function __sign(str) {
+  return __b64url(crypto.createHmac('sha256', JWT_SECRET).update(str).digest());
+}
+function __makeToken(payloadObj) {
+  if (!JWT_SECRET) return '';
+  const header = __b64url(JSON.stringify({ alg:'HS256', typ:'JWT' }));
+  const payload = __b64url(JSON.stringify(payloadObj));
+  const sig = __sign(`${header}.${payload}`);
+  return `${header}.${payload}.${sig}`;
+}
+function __verifyToken(token) {
+  try {
+    if (!JWT_SECRET) return null;
+    const parts = String(token || '').split('.');
+    if (parts.length !== 3) return null;
+    const [h, p, s] = parts;
+    const ok = __sign(`${h}.${p}`) === s;
+    if (!ok) return null;
+    const json = Buffer.from(p.replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString('utf8');
+    return JSON.parse(json);
+  } catch { return null; }
+}
+function __getBearer(req) {
+  const h = String(req.headers.authorization || '');
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : '';
 }
 
 async function __fetchLiveOrdersFromStore(limit) {
-  // Best-effort: supports multiple possible function names without crashing
   try {
     if (store && typeof store.getLiveOrders === 'function') return await store.getLiveOrders({ limit });
     if (store && typeof store.listLiveOrders === 'function') return await store.listLiveOrders({ limit });
@@ -1083,9 +1180,8 @@ async function __fetchLiveOrdersFromStore(limit) {
   return null;
 }
 
-const __PORT = Number(process.env.PORT || 10000);
 const __server = http.createServer(async (req, res) => {
-  __setCors(res);
+  __setCors(req, res);
 
   if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end(); }
 
@@ -1097,28 +1193,24 @@ const __server = http.createServer(async (req, res) => {
     return res.end('bad url');
   }
 
+  // Health
   if (u.pathname === '/' || u.pathname === '/health') {
     return __json(res, 200, { ok: true, service: 'gg-agent', time: new Date().toISOString() });
   }
 
-  if (u.pathname === '/api/live-orders') {
+  // Live feed (for quick polling / debugging)
+  if (u.pathname === '/api/live-orders' && req.method === 'GET') {
     const limit = Math.max(1, Math.min(250, Number(u.searchParams.get('limit') || 50)));
     const includeRaw = String(u.searchParams.get('raw') || '') === '1';
 
-    // Try Supabase/store first, fallback to in-memory feed
     const fromStore = await __fetchLiveOrdersFromStore(limit);
     const source = Array.isArray(fromStore) && fromStore.length ? 'store' : 'memory';
-
     let items = (source === 'store') ? fromStore : __liveFeed.slice(0, limit);
 
-    // Normalize + raw handling
     items = (Array.isArray(items) ? items : []).slice(0, limit).map((x) => {
       const o = { ...(x || {}) };
-
-      // If store data doesn't include received_at, add a fallback
       if (!o.received_at) o.received_at = o.created_at || new Date().toISOString();
 
-      // raw included only if requested (privacy)
       if (!includeRaw) {
         delete o._raw;
         delete o.raw;
@@ -1128,21 +1220,63 @@ const __server = http.createServer(async (req, res) => {
       return o;
     });
 
-    return __json(res, 200, {
-      ok: true,
-      source,
-      count: items.length,
-      items
-    });
+    return __json(res, 200, { ok: true, source, count: items.length, items });
   }
 
+  // Reserved (next phase): Admin + Creator APIs
+  // We keep them stubbed so nothing breaks today.
+  if (u.pathname === '/api/admin/login' && req.method === 'POST') {
+    try {
+      const body = await __readBody(req, 64 * 1024);
+      const data = JSON.parse(body || '{}');
+
+      const ADMIN_USER = String(process.env.ADMIN_USER || '');
+      const ADMIN_PASS = String(process.env.ADMIN_PASS || '');
+      if (!ADMIN_USER || !ADMIN_PASS || !JWT_SECRET) {
+        return __json(res, 501, { ok:false, error:'admin_auth_not_configured' });
+      }
+
+      const ok = String(data.username || '') === ADMIN_USER && String(data.password || '') === ADMIN_PASS;
+      if (!ok) return __json(res, 401, { ok:false, error:'invalid_credentials' });
+
+      const token = __makeToken({ role:'admin', iat: Date.now() });
+      return __json(res, 200, { ok:true, token });
+    } catch {
+      return __json(res, 400, { ok:false, error:'bad_request' });
+    }
+  }
+
+  if (u.pathname === '/api/creator/login' && req.method === 'POST') {
+    // NOTE: real validation will be implemented in store (SQLite) next.
+    try {
+      const body = await __readBody(req, 64 * 1024);
+      const data = JSON.parse(body || '{}');
+      if (!JWT_SECRET) return __json(res, 501, { ok:false, error:'jwt_not_configured' });
+
+      const code = String(data.code || '').trim();
+      const password = String(data.password || '').trim();
+      if (!code || !password) return __json(res, 400, { ok:false, error:'missing_fields' });
+
+      // If store supports credential check, use it. Else block (secure default).
+      if (store && typeof store.verifyCreatorLogin === 'function') {
+        const ok = await store.verifyCreatorLogin({ code, password });
+        if (!ok) return __json(res, 401, { ok:false, error:'invalid_credentials' });
+        const token = __makeToken({ role:'creator', code, iat: Date.now() });
+        return __json(res, 200, { ok:true, token });
+      }
+      return __json(res, 501, { ok:false, error:'creator_auth_not_ready' });
+    } catch {
+      return __json(res, 400, { ok:false, error:'bad_request' });
+    }
+  }
+
+  // Default
   return __json(res, 404, { ok: false, error: 'not_found' });
 });
 
-// Start server (safe even if you only use bot)
 // NOTE: Render only gives you a public URL if this is a WEB SERVICE.
 __server.listen(__PORT, () => {
-  console.log(`LIVE API listening on :${__PORT} (GET /api/live-orders)`);
+  console.log(`WEB API listening on :${__PORT} | health=/health | live=/api/live-orders`);
 });
 
 // ────────────────────────────────────────────────────────────────────────────────
@@ -1166,87 +1300,34 @@ function mapFieldsFromSummary(parsed, rawText) {
   const address = addrMatch ? addrMatch[1].trim() : (f.area || '');
   const map_url = f.map || '';
 
+  const totalNum = Number(f.total || 0) || 0;
+  const delNum   = Number(f.delivery || 0) || 0;
+  const coffeeSubtotal = Math.max(0, totalNum - delNum);
+
   return {
     customer_name:  f.customerName || '',
     email,
     phone:          f.phone || '',
+
     type:           f.type || '',
     size:           f.size || '',
     roast_level:    f.roast || '',
     qty:            f.qty || '',
-    product_price:  null,                 // optional; total/delivery will fill total
-    delivery_price: f.delivery || '',
-    total:          f.total || '',
+
+    // Totals
+    delivery_price: delNum,
+    total:          totalNum,
+    coffee_subtotal: coffeeSubtotal,
+
+    // Location
     delivery_location: address,
     map_url,
+
+    // ✅ Creator program
+    promo_code: f.promo_code || '',
+    promo_pct:  f.promo_pct || 0,
+
+    // Optional raw items if store wants them later
+    items: Array.isArray(f.items) ? f.items : []
   };
 }
-
-function watchFile(fp, onChange) {
-  try {
-    if (!fs.existsSync(fp)) return;
-    fs.watch(fp, { persistent: false }, (ev) => {
-      if (ev === 'change') {
-        try { onChange(); } catch (e) { console.warn('[hot] reload error:', e.message); }
-      }
-    });
-  } catch (e) {
-    console.warn('[hot] watcher failed for', fp, e.message);
-  }
-}
-// ================== RENDER WEB SERVER (DO NOT REMOVE) ==================
-try {
-  const http = require("http");
-  const PORT = Number(process.env.PORT || 3000);
-
-  // Safe getter for live orders (supports different export names)
-  function getLiveOrdersSafe() {
-    try {
-      const feed = liveOrderFeed || null;
-      if (!feed) return [];
-      const fn =
-        feed.getLiveOrders ||
-        feed.getOrders ||
-        feed.list ||
-        feed.snapshot ||
-        feed.getSnapshot ||
-        feed.dump ||
-        null;
-      if (typeof fn === "function") return fn.call(feed) || [];
-      if (Array.isArray(feed.orders)) return feed.orders;
-      if (Array.isArray(feed._orders)) return feed._orders;
-      return [];
-    } catch {
-      return [];
-    }
-  }
-
-  const server = http.createServer((req, res) => {
-    // CORS for your new dashboard app
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
-
-    if (req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      return res.end("ok");
-    }
-
-    if (req.url === "/api/live-orders") {
-      const data = getLiveOrdersSafe();
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, count: data.length, orders: data }));
-    }
-
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: false, error: "Not found" }));
-  });
-
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`[web] listening on ${PORT}`);
-  });
-} catch (e) {
-  console.log("[web] failed to start:", e?.message || e);
-}
-// =======================================================================
