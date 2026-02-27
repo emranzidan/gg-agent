@@ -673,8 +673,10 @@ bot.on('callback_query', async (ctx, next) => {
         if (!RE_REVIEW_ON_UNDO) return ctx.answerCbQuery('Undo disabled.');
         const ref = data.split(':')[1];
         const s = Session.getSessionByRef(ref);
-        if (!s || s.status !== 'APPROVED_HOLD') return ctx.answerCbQuery('Nothing to undo.');
+        if (!s || (s.status !== 'APPROVED_HOLD' && s.status !== 'REJECTED_HOLD')) return ctx.answerCbQuery('Nothing to undo.');
         if (s.approvalTimer) { clearTimeout(s.approvalTimer); s.approvalTimer = null; }
+        if (s.rejectTimer)   { clearTimeout(s.rejectTimer);   s.rejectTimer   = null; }
+        const wasRejectHold = (s.status === 'REJECTED_HOLD');
         s.status = 'AWAITING_RECEIPT';
         s.assigned_driver_id = null; s.giveupUntil = null;
         s.createdAt = Date.now();
@@ -686,7 +688,7 @@ bot.on('callback_query', async (ctx, next) => {
            Markup.button.callback(get(MSG,'buttons.reject')  || 'Reject',  `reject:${s._customerId || '0'}:${s.ref}`)]
         ]);
         await bot.telegram.sendMessage(STAFF_GROUP_ID, t('staff.re_review_prompt', { REF: s.ref }), reKb);
-        return ctx.answerCbQuery('Approval undone.');
+        return ctx.answerCbQuery(wasRejectHold ? 'Rejection undone.' : 'Approval undone.');
       }
 
       const [verb, userIdStr, ref] = data.split(':');
@@ -717,12 +719,56 @@ bot.on('callback_query', async (ctx, next) => {
         return ctx.answerCbQuery('Approved (on hold).');
       }
 
-      // reject
-      s.status = 'REJECTED';
-      if (uid) await ctx.telegram.sendMessage(uid, t('customer.payment_rejected', { REF: s.ref, SUPPORT_PHONE })).catch(()=>{});
-      await ctx.editMessageCaption({ caption: t('staff.rejected_caption', { REF: s.ref }) }).catch(()=>{});
-      await ctx.telegram.sendMessage(STAFF_GROUP_ID, t('staff.rejected_notice', { REF: s.ref }));
-      return ctx.answerCbQuery('Rejected.');
+      // reject (ON HOLD with UNDO)
+      s.status = 'REJECTED_HOLD';
+
+      // Update the receipt caption so staff sees it's on hold
+      await ctx.editMessageCaption({
+        caption: `❌ Rejected (on hold ${HOLD_SECONDS}s) — ${s.ref}`
+      }).catch(()=>{});
+
+      // Send hold message with Undo button (same undo:<ref>)
+      const holdMsg = await ctx.telegram.sendMessage(
+        STAFF_GROUP_ID,
+        `❌ Rejection on hold for ${HOLD_SECONDS}s — ${s.ref}\nTap Undo if this was a mistake.`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback(get(MSG,'buttons.undo_hold') || `Undo (${HOLD_SECONDS}s)`, `undo:${s.ref}`)]
+        ])
+      );
+      s.holdMsgId = holdMsg.message_id;
+
+      // Finalize rejection after hold time if not undone
+      s.rejectTimer = setTimeout(async () => {
+        const fresh = Session.getSessionByRef(ref);
+        if (!fresh || fresh.status !== 'REJECTED_HOLD') return;
+
+        fresh.status = 'REJECTED';
+
+        // customer + staff final notice
+        if (uid) await bot.telegram.sendMessage(
+          uid,
+          t('customer.payment_rejected', { REF: fresh.ref, SUPPORT_PHONE })
+        ).catch(()=>{});
+
+        await bot.telegram.sendMessage(
+          STAFF_GROUP_ID,
+          t('staff.rejected_notice', { REF: fresh.ref })
+        ).catch(()=>{});
+
+        // mark hold message as final
+        if (fresh.holdMsgId) {
+          await bot.telegram.editMessageText(
+            STAFF_GROUP_ID,
+            fresh.holdMsgId,
+            undefined,
+            `❌ Rejected (final) — ${fresh.ref}`
+          ).catch(()=>{});
+        }
+
+        fresh.rejectTimer = null;
+      }, HOLD_SECONDS * 1000);
+
+      return ctx.answerCbQuery('Rejected (on hold).');
     }
 
     // Driver accept/decline
